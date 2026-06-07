@@ -40,14 +40,22 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         var eventTopics: [String] {
             switch self {
             case .renderGrid:
-                return ["workspace.updated", "terminal.render_grid"]
+                return ["workspace.updated", "terminal.render_grid", "notification.dismissed"]
             case .rawBytes:
-                return ["workspace.updated", "terminal.bytes"]
+                return ["workspace.updated", "terminal.bytes", "notification.dismissed"]
             }
         }
     }
 
     private static let hasKnownPairedMacDefaultsKey = "cmux.mobile.hasKnownPairedMac"
+
+    /// Max seconds the launch reconnect may keep the restoring gate
+    /// (``RestoringSessionView``) on screen before resolving to the
+    /// disconnected/add-device UI. A stored Mac whose route went stale makes the
+    /// connect hang on a slow timeout; this caps the visible "Restoring session…"
+    /// window so a returning user is never stuck on it. The connect keeps trying
+    /// in the background, so a later success still flips to the workspaces.
+    private static let storedMacReconnectRestoringDeadlineSeconds: Double = 6
 
     private static let terminalRenderGridCapability = "terminal.render_grid.v1"
     private static let workspaceActionsCapability = "workspace.actions.v1"
@@ -226,6 +234,7 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     private let pairedMacStore: (any MobilePairedMacStoring)?
     private let identityProvider: (any MobileIdentityProviding)?
     private let reachability: any ReachabilityProviding
+    private let deliveredNotificationClearer: any DeliveredNotificationClearing
     private let pairingHintDefaults: UserDefaults
     private let clientID: String
     /// The injected, fire-and-forget product-analytics emitter. Defaults to
@@ -350,6 +359,7 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         clientIDRepository: MobileClientIDRepository = MobileClientIDRepository(defaults: .standard),
         identityProvider: (any MobileIdentityProviding)? = nil,
         reachability: any ReachabilityProviding = ReachabilityService(),
+        deliveredNotificationClearer: any DeliveredNotificationClearing = SystemDeliveredNotificationClearer(),
         pairingHintDefaults: UserDefaults = .standard,
         analytics: any AnalyticsEmitting = NoopAnalytics(),
         diagnosticLog: DiagnosticLog? = nil
@@ -358,6 +368,7 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         self.pairedMacStore = pairedMacStore
         self.identityProvider = identityProvider
         self.reachability = reachability
+        self.deliveredNotificationClearer = deliveredNotificationClearer
         self.pairingHintDefaults = pairingHintDefaults
         self.analytics = analytics
         self.diagnosticLog = diagnosticLog
@@ -694,6 +705,50 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     }
     #endif
 
+    // MARK: - Notification dismiss-sync
+
+    /// Tell the Mac that one or more mirrored notifications were dismissed on
+    /// this phone (a swipe/clear on the delivered banner). The Mac marks them
+    /// read and clears its own banner; its store then emits `notification.dismissed`
+    /// back, which is a harmless no-op for the already-removed phone banner.
+    ///
+    /// Fire-and-forget against the authoritative Mac store. Carries only opaque
+    /// notification UUIDs, never terminal content, so it is safe regardless of
+    /// the Mac's phone-forward hideContent setting.
+    /// - Parameter ids: The stable notification ids the user dismissed.
+    public func dismissNotification(ids: [String]) async {
+        let trimmed = ids
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !trimmed.isEmpty, let client = remoteClient else { return }
+        do {
+            let request = try MobileCoreRPCClient.requestData(
+                method: "notification.dismiss",
+                params: [
+                    "notification_ids": trimmed,
+                    "client_id": clientID,
+                ]
+            )
+            _ = try await client.sendRequest(request)
+        } catch {
+            mobileShellLog.error("notification dismiss sync failed count=\(trimmed.count, privacy: .public) error=\(String(describing: error), privacy: .public)")
+        }
+    }
+
+    /// Clear delivered banners on this phone in response to a Mac-side dismiss
+    /// (`notification.dismissed` peer event). The stable notification id was sent
+    /// to APNs as the `apns-collapse-id`, so the delivered remote notification's
+    /// `request.identifier` equals that id, which is what the injected
+    /// ``DeliveredNotificationClearing`` seam matches on.
+    /// - Parameter ids: The notification ids the Mac dismissed.
+    public func clearDeliveredNotifications(ids: [String]) {
+        let trimmed = ids
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !trimmed.isEmpty else { return }
+        deliveredNotificationClearer.removeDelivered(ids: trimmed)
+    }
+
     // MARK: - Network recovery
 
     /// True while an automatic reconnect is in progress after a network change
@@ -955,7 +1010,26 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         guard generation == storedMacReconnectGeneration else { return false }
         setHasKnownPairedMac(true, generation: generation)
         isReconnectingStoredMac = true
+        // Cap how long the restoring gate stays up: a stored Mac whose route went
+        // stale (Tailscale address changed, or it's offline) makes connectManualHost
+        // hang on a slow connect timeout, and the gate shows RestoringSessionView for
+        // that whole time. After the deadline, resolve the gate so the user reaches
+        // add-device quickly; the connect keeps trying, so a later success still
+        // flips connectionState to .connected and shows the workspaces.
+        let restoringDeadline = Task { [weak self] in
+            // Bounded, cancellable deadline (not a poll) — cancelled the instant the
+            // connect resolves; only caps the restoring-gate window.
+            try? await ContinuousClock().sleep(
+                for: .seconds(Self.storedMacReconnectRestoringDeadlineSeconds)
+            )
+            guard let self, !Task.isCancelled,
+                  generation == self.storedMacReconnectGeneration,
+                  self.connectionState != .connected else { return }
+            self.isReconnectingStoredMac = false
+            self.didFinishStoredMacReconnectAttempt = true
+        }
         await connectManualHost(name: mac.displayName ?? host, host: host, port: port)
+        restoringDeadline.cancel()
         // A newer attempt may have started during the connect; it now owns the flags.
         guard generation == storedMacReconnectGeneration else { return false }
         isReconnectingStoredMac = false
@@ -1057,6 +1131,13 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         // supersedes it via `beginPairingAttempt`, leaving `connectionState`
         // `.connected` for the other Mac; matching the live route prevents this
         // superseded task from persisting a stale active target.
+        //
+        // Route equality is the only reliable signal here: `connectManualHost`
+        // mints a synthetic `manual-<host>:<port>` ticket id (see
+        // `manualHostTicket`), so `activeTicket?.macDeviceID` cannot reconcile
+        // against the real stored Mac id. A host:port that has been reassigned to
+        // a different Mac is an unhandleable manual-reconnect limitation shared
+        // with `reconnectActiveMacIfAvailable`, not specific to switching.
         if connectionState == .connected,
            case let .hostPort(liveHost, livePort)? = activeRoute?.endpoint,
            liveHost == normalizedHost, livePort == port {
@@ -1090,6 +1171,50 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
             mobileShellLog.error("paired mac store remove failed mac=\(macDeviceID, privacy: .public) error=\(String(describing: error), privacy: .public)")
         }
         await loadPairedMacs()
+    }
+
+    /// Pair another Mac from a scanned QR/link without stranding the current
+    /// session, for the "Pair Another Mac" action in the host switcher.
+    ///
+    /// ``connectPairingURL(_:)`` is destructive: it begins a fresh pairing
+    /// attempt that replaces/clears the live remote client during connect, so a
+    /// stale, expired, or offline code would otherwise tear down a working
+    /// session. Mirroring ``switchToMac(macDeviceID:)``, if there was a live
+    /// connection that failed to move to the new Mac, the previously-active Mac
+    /// is reconnected so the user is not dropped on a bad scan. The host picker
+    /// should dismiss only when this returns `true`.
+    /// - Parameter rawValue: The scanned pairing URL/code.
+    /// - Returns: `true` only when the new Mac connected; `false` on a failed or
+    ///   superseded attempt (the picker stays open).
+    @discardableResult
+    public func pairAdditionalMac(_ rawValue: String) async -> Bool {
+        // The session to fall back to if the new pairing fails to connect.
+        let hadLiveConnection = connectionState == .connected
+        // Capture the scoped Stack user id *before* the destructive connect. The
+        // failure fallback must reconnect only within this user's pairings, never
+        // via `activeMac(stackUserID: nil)`, which is the store's all-users query
+        // and could reconnect another Stack user's Mac on a shared device.
+        let fallbackStackUserID = identityProvider?.currentUserID
+        let result = await connectPairingURLResult(rawValue)
+        switch result {
+        case .connected:
+            await loadPairedMacs()
+            return true
+        case .superseded:
+            // Another pairing/switch attempt took over; leave its state intact.
+            return false
+        case .failed:
+            // The destructive connect path dropped the previous session; if we
+            // had one and still have a scoped identity, reconnect the still-active
+            // stored Mac so the user is not left disconnected after a bad scan. No
+            // scoped identity means no safe reconnect target, so we skip it rather
+            // than fall into the unscoped all-users lookup.
+            if hadLiveConnection, let fallbackStackUserID {
+                _ = await reconnectActiveMacIfAvailable(stackUserID: fallbackStackUserID)
+            }
+            await loadPairedMacs()
+            return false
+        }
     }
 
     static func firstReconnectHostPortRoute(
@@ -2601,6 +2726,10 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
                     // pty-tee. This is the compatibility fallback when the Mac
                     // host does not advertise `terminal.render_grid.v1`.
                     self.handleTerminalBytesEvent(event)
+                } else if event.topic == "notification.dismissed" {
+                    // The Mac dismissed/cleared notifications; clear the matching
+                    // mirrored banners on this phone.
+                    self.handleNotificationDismissedEvent(event)
                 }
             }
             guard let self else { return }
@@ -3030,6 +3159,17 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         #endif
         guard !bytes.isEmpty else { return }
         deliverTerminalBytes(bytes, surfaceID: renderGrid.surfaceID)
+    }
+
+    private func handleNotificationDismissedEvent(_ event: MobileEventEnvelope) {
+        guard
+            let json = event.payloadJSON,
+            let payload = MobileNotificationDismissedEvent.decode(json),
+            !payload.ids.isEmpty
+        else {
+            return
+        }
+        clearDeliveredNotifications(ids: payload.ids)
     }
 
     private func handleTerminalBytesEvent(_ event: MobileEventEnvelope) {
