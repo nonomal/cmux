@@ -60,6 +60,20 @@ public protocol GhosttySurfaceViewDelegate: AnyObject {
     /// path into the terminal so a running TUI (e.g. Claude Code) attaches it.
     /// `format` is a lowercase file-extension hint (e.g. `"png"`). Optional.
     func ghosttySurfaceView(_ surfaceView: GhosttySurfaceView, didPasteImage data: Data, format: String)
+    /// The user pasted an image that is too large to send even after trying a
+    /// compressed JPEG, so nothing was uploaded. The host should surface a
+    /// user-visible "too large" notice. Optional.
+    func ghosttySurfaceViewDidFailToPasteImageTooLarge(_ surfaceView: GhosttySurfaceView)
+    /// The composer accessory button was tapped; the host should toggle the
+    /// iMessage-style composer above the terminal. Optional.
+    func ghosttySurfaceViewDidRequestComposerToggle(_ surfaceView: GhosttySurfaceView)
+    /// Forward a committed block of text (system dictation, an autocorrect
+    /// replacement, or keyboard-inserted clipboard text) that should reach the
+    /// remote terminal as a bracketed paste rather than per-character input. The
+    /// host sends it via the `terminal.paste` RPC so embedded newlines do not
+    /// fragment into separate Returns. Defaults to the raw-input path so existing
+    /// conformers keep working. Optional.
+    func ghosttySurfaceView(_ surfaceView: GhosttySurfaceView, didPasteText text: String)
 }
 
 public extension GhosttySurfaceViewDelegate {
@@ -67,6 +81,21 @@ public extension GhosttySurfaceViewDelegate {
     func ghosttySurfaceView(_ surfaceView: GhosttySurfaceView, didTapAtCol col: Int, row: Int) {}
     func ghosttySurfaceViewDidRequestToolbarSettings(_ surfaceView: GhosttySurfaceView) {}
     func ghosttySurfaceView(_ surfaceView: GhosttySurfaceView, didPasteImage data: Data, format: String) {}
+    func ghosttySurfaceViewDidFailToPasteImageTooLarge(_ surfaceView: GhosttySurfaceView) {}
+    func ghosttySurfaceViewDidRequestComposerToggle(_ surfaceView: GhosttySurfaceView) {}
+    /// Default bracketed-paste handler that falls back to per-character input.
+    ///
+    /// A conformer that does not implement the bracketed-paste path still
+    /// delivers the text: newlines are normalized to CR (matching the
+    /// per-keystroke input path) and the bytes are forwarded through
+    /// ``ghosttySurfaceView(_:didProduceInput:)``.
+    /// - Parameters:
+    ///   - surfaceView: The surface view that produced the committed block.
+    ///   - text: The committed block of pasted/dictated text.
+    func ghosttySurfaceView(_ surfaceView: GhosttySurfaceView, didPasteText text: String) {
+        let normalized = text.replacingOccurrences(of: "\n", with: "\r")
+        ghosttySurfaceView(surfaceView, didProduceInput: Data(normalized.utf8))
+    }
 }
 
 @MainActor
@@ -268,6 +297,9 @@ public enum TerminalInputAccessoryAction: Int, CaseIterable, Sendable {
     /// path. Unlike the other actions it carries no fixed byte ``output``; the
     /// host reads the pasteboard when it is tapped.
     case paste
+    // Appended at the end so existing persisted raw values (user accessory bar
+    // order/enabled set) are preserved.
+    case composer
     var title: String {
         title(isMacRemote: false)
     }
@@ -285,6 +317,8 @@ public enum TerminalInputAccessoryAction: Int, CaseIterable, Sendable {
         case .zoomOut:
             return ""
         case .zoomIn:
+            return ""
+        case .composer:
             return ""
         case .escape:
             return String(localized: "terminal.input_accessory.title.escape", defaultValue: "Esc")
@@ -341,6 +375,7 @@ public enum TerminalInputAccessoryAction: Int, CaseIterable, Sendable {
         case .shift: return "terminal.inputAccessory.shift"
         case .zoomOut: return "terminal.inputAccessory.zoomOut"
         case .zoomIn: return "terminal.inputAccessory.zoomIn"
+        case .composer: return "terminal.inputAccessory.composer"
         case .escape: return "terminal.inputAccessory.escape"
         case .tab: return "terminal.inputAccessory.tab"
         case .upArrow: return "terminal.inputAccessory.up"
@@ -374,6 +409,8 @@ public enum TerminalInputAccessoryAction: Int, CaseIterable, Sendable {
             return String(localized: "terminal.input_accessory.zoom_in", defaultValue: "Zoom In")
         case .paste:
             return String(localized: "terminal.input_accessory.paste", defaultValue: "Paste")
+        case .composer:
+            return String(localized: "terminal.input_accessory.composer", defaultValue: "Composer")
         default:
             return nil
         }
@@ -387,6 +424,8 @@ public enum TerminalInputAccessoryAction: Int, CaseIterable, Sendable {
             return "plus.magnifyingglass"
         case .paste:
             return "doc.on.clipboard"
+        case .composer:
+            return "square.and.pencil"
         default:
             return nil
         }
@@ -413,7 +452,7 @@ public enum TerminalInputAccessoryAction: Int, CaseIterable, Sendable {
 
     var output: Data? {
         switch self {
-        case .control, .alternate, .command, .shift, .zoomOut, .zoomIn, .paste:
+        case .control, .alternate, .command, .shift, .zoomOut, .zoomIn, .paste, .composer:
             return nil
         case .escape:
             return Data([0x1B])
@@ -524,7 +563,7 @@ public enum TerminalInputAccessoryAction: Int, CaseIterable, Sendable {
         case .pageUp: return String(localized: "terminal.shortcut.name.pageUp", defaultValue: "Page Up")
         case .pageDown: return String(localized: "terminal.shortcut.name.pageDown", defaultValue: "Page Down")
         case .paste: return String(localized: "terminal.input_accessory.paste", defaultValue: "Paste")
-        case .control, .alternate, .command, .shift, .zoomIn, .zoomOut:
+        case .control, .alternate, .command, .shift, .zoomIn, .zoomOut, .composer:
             return title
         }
     }
@@ -805,13 +844,31 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
             TerminalInputDebugLog.log("surface.onEscape data=\(TerminalInputDebugLog.dataSummary(data))")
             self.delegate?.ghosttySurfaceView(self, didProduceInput: data)
         }
+        inputProxy.onPasteText = { [weak self] text in
+            guard let self else { return }
+            self.resetCursorBlink()
+            // Multi-character commits (dictation, autocorrect, keyboard clipboard
+            // insert) go through the bracketed-paste RPC so embedded newlines are
+            // not split into separate Returns by the remote terminal.
+            TerminalInputDebugLog.log("surface.onPasteText text=\(TerminalInputDebugLog.textSummary(text))")
+            self.delegate?.ghosttySurfaceView(self, didPasteText: text)
+        }
         inputProxy.onPasteImage = { [weak self] data, format in
             guard let self else { return }
             TerminalInputDebugLog.log("surface.onPasteImage bytes=\(data.count) format=\(format)")
             self.delegate?.ghosttySurfaceView(self, didPasteImage: data, format: format)
         }
+        inputProxy.onPasteImageTooLarge = { [weak self] in
+            guard let self else { return }
+            TerminalInputDebugLog.log("surface.onPasteImageTooLarge")
+            self.delegate?.ghosttySurfaceViewDidFailToPasteImageTooLarge(self)
+        }
         inputProxy.onZoom = { [weak self] direction in
             self?.performFontZoom(direction)
+        }
+        inputProxy.onToggleComposer = { [weak self] in
+            guard let self else { return }
+            self.delegate?.ghosttySurfaceViewDidRequestComposerToggle(self)
         }
         inputProxy.onHideKeyboard = { [weak self] in
             guard let self else { return }
@@ -1062,6 +1119,25 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         dockedToolbar = toolbar
         reservedToolbarHeight = Self.persistentToolbarHeight
         layoutDockedToolbar()
+    }
+
+    /// Hide or restore the docked accessory bar while the SwiftUI composer is
+    /// open. The composer owns the bottom edge (and the keyboard) when active, so
+    /// the docked bar would otherwise collide with it above the keyboard. Hiding
+    /// it and releasing its reserved grid height lets the composer sit flush
+    /// below the terminal grid.
+    public func setComposerActive(_ active: Bool) {
+        let reserved: CGFloat = active ? 0 : Self.persistentToolbarHeight
+        guard dockedToolbar?.isHidden != active || reservedToolbarHeight != reserved else { return }
+        dockedToolbar?.isHidden = active
+        reservedToolbarHeight = reserved
+        // Deliberately do NOT resign the terminal input proxy here. The composer's
+        // text field becomes first responder while this keyboard is still up, so
+        // iOS hands the keyboard over in place. Resigning first tore the keyboard
+        // down and the composer immediately re-summoned it (the visible
+        // disappear/reappear flicker).
+        setNeedsGeometrySync()
+        setNeedsLayout()
     }
 
     /// Full-width bar whose bottom sits on the keyboard (when up) or the very

@@ -1,3 +1,4 @@
+import CMUXMobileCore
 import CmuxMobileTerminalKit
 import Foundation
 import UIKit
@@ -6,16 +7,31 @@ final class TerminalInputTextView: UITextView {
     var onText: ((String) -> Void)?
     var onBackspace: (() -> Void)?
     var onEscapeSequence: ((Data) -> Void)?
+    /// Invoked for a committed *block* of text (more than one character) that no
+    /// modifier transforms: system dictation, autocorrect/predictive-bar
+    /// replacements, and clipboard text inserted by the keyboard all arrive this
+    /// way. The host routes the block through a bracketed-paste RPC so the remote
+    /// terminal receives it as a single paste rather than per-character input,
+    /// which avoids CR-fragmenting multi-line text and lets TUIs treat it as
+    /// pasted content. Single characters and Return still ride ``onText``.
+    var onPasteText: ((String) -> Void)?
     /// Invoked when the Paste accessory button reads an image off the system
     /// clipboard. The host forwards the bytes (+ a lowercase format hint) to the
     /// Mac, which injects the resulting file path into the terminal. Clipboard
     /// *text* does not use this path; it rides ``onText``.
     var onPasteImage: ((Data, String) -> Void)?
+    /// Fired when a pasted image is too large to send even after trying a
+    /// compressed JPEG fallback, so the host can surface a "too large" notice
+    /// instead of the paste silently doing nothing.
+    var onPasteImageTooLarge: (() -> Void)?
     var onZoom: ((TerminalFontZoomDirection) -> Void)?
     var onHideKeyboard: (() -> Void)?
     /// Fired by the trailing "customize" button so the SwiftUI host can present
     /// the toolbar shortcuts editor.
     var onOpenToolbarSettings: (() -> Void)?
+    /// Invoked when the composer accessory button is tapped. The host toggles
+    /// the iMessage-style composer above the terminal.
+    var onToggleComposer: (() -> Void)?
     var accessoryLayoutInsetsProvider: (() -> UIEdgeInsets)?
     /// The leftmost toolbar button. Toggles its glyph between dismiss-keyboard
     /// (when the keyboard is up) and show-keyboard (when down) via
@@ -44,6 +60,25 @@ final class TerminalInputTextView: UITextView {
 
     override var canBecomeFirstResponder: Bool { true }
 
+    /// Always report that there is text to delete.
+    ///
+    /// This is the load-bearing piece (borrowed from iSH's `TerminalView`) that
+    /// makes the system software keyboard's *hold-to-repeat* backspace work. The
+    /// keyboard's auto-repeat timer keeps firing ``deleteBackward()`` only while
+    /// the first responder reports `hasText == true`; the moment it reads
+    /// `false` the repeat stops. Because this view keeps a perpetually-empty
+    /// document (every committed keystroke is forwarded to the Mac and the local
+    /// buffer is cleared), the inherited `UITextView.hasText` returned `false`,
+    /// so holding backspace deleted exactly one character. Forcing `true` here
+    /// lets the keyboard repeat indefinitely, just like a normal text field. It
+    /// is always safe to send a DEL byte to the remote terminal, so there is no
+    /// "nothing to delete" state to honor.
+    ///
+    /// Internal byte-routing must therefore *not* key off `hasText` (it is now a
+    /// constant); ``deleteBackward()`` and the modifier guards key off
+    /// ``markedTextRange`` (IME composition) instead.
+    override var hasText: Bool { true }
+
     override var keyCommands: [UIKeyCommand]? {
         guard markedTextRange == nil else { return nil }
         return TerminalHardwareKeyResolver.makeKeyCommands(
@@ -56,7 +91,7 @@ final class TerminalInputTextView: UITextView {
     private static let accessoryHorizontalInset: CGFloat = 16
     private static let accessoryButtonFont = UIFont.systemFont(ofSize: 14, weight: .medium)
     private static let accessoryButtonSymbolConfig = UIImage.SymbolConfiguration(pointSize: 14, weight: .medium)
-    private static let accessoryButtonInsets = UIEdgeInsets(top: 5, left: 10, bottom: 5, right: 10)
+    private static let accessoryButtonContentInsets = NSDirectionalEdgeInsets(top: 5, leading: 10, bottom: 5, trailing: 10)
     private static let accessoryButtonCornerRadius: CGFloat = 6
     private static let accessoryButtonHeight: CGFloat = 28
     private static let accessoryButtonMinWidth: CGFloat = 44
@@ -200,7 +235,7 @@ final class TerminalInputTextView: UITextView {
     /// user-configurable shortcuts. Command is created but kept out of the
     /// stack until ``applyModifierPresentation()`` inserts it for a Mac remote.
     private static let pinnedLeadingActions: [TerminalInputAccessoryAction] = [
-        .control, .alternate, .command, .paste,
+        .composer, .control, .alternate, .command, .paste,
     ]
 
     /// The structural buttons pinned to the end of the bar, after the
@@ -273,17 +308,12 @@ final class TerminalInputTextView: UITextView {
     /// configuration-driven rebuild can re-apply it without toggling the flag.
     private func applyModifierPresentation() {
         guard let stack = accessoryStackView else { return }
-        for case let button as AccessoryActionButton in stack.arrangedSubviews {
-            guard case let .builtin(action) = button.item else { continue }
-            button.setTitle(action.title(isMacRemote: isMacRemote), for: .normal)
-        }
-        // Insert/remove the command button based on whether this is a Mac terminal.
-        // We manage it outside the normal loop because it's not always in arrangedSubviews.
+        // Insert/remove the command button first (it is not always in
+        // arrangedSubviews) so the restyle pass below covers it when present.
         if let cmdButton = commandAccessoryButton {
             if isMacRemote {
                 if cmdButton.superview == nil {
-                    // Insert after alternate (index 2 in original enum order: ctrl, alt, cmd)
-                    // Find the alt button's index in the current arrangedSubviews
+                    // Insert after alternate (ctrl, alt, cmd order).
                     var insertIndex = stack.arrangedSubviews.count
                     for (idx, view) in stack.arrangedSubviews.enumerated() {
                         if let button = view as? AccessoryActionButton,
@@ -294,12 +324,25 @@ final class TerminalInputTextView: UITextView {
                     }
                     stack.insertArrangedSubview(cmdButton, at: insertIndex)
                 }
-            } else {
-                if cmdButton.superview != nil {
-                    stack.removeArrangedSubview(cmdButton)
-                    cmdButton.removeFromSuperview()
-                }
+            } else if cmdButton.superview != nil {
+                stack.removeArrangedSubview(cmdButton)
+                cmdButton.removeFromSuperview()
             }
+        }
+        // Restyle every visible button for the current remote (built-in titles
+        // depend on `isMacRemote`) and its armed/sticky state. Custom actions
+        // never arm.
+        for case let button as AccessoryActionButton in stack.arrangedSubviews {
+            let armed: Bool
+            let sticky: Bool
+            if case let .builtin(action) = button.item {
+                armed = isAccessoryActionArmed(action)
+                sticky = isAccessoryActionSticky(action)
+            } else {
+                armed = false
+                sticky = false
+            }
+            applyAccessoryButtonStyle(button, item: button.item, armed: armed, sticky: sticky)
         }
         // Disarm command state if switching away from Mac remote (clears a
         // sticky lock too, matching the legacy unconditional setter).
@@ -359,7 +402,13 @@ final class TerminalInputTextView: UITextView {
     }
 
     override func deleteBackward() {
-        if commandAccessoryArmed, markedTextRange == nil, !hasText {
+        // Routing keys off `markedTextRange` (IME composition in progress), NOT
+        // `hasText`: `hasText` is now a forced constant `true` so the software
+        // keyboard auto-repeats backspace, so it can no longer mean "the local
+        // document is empty". While composing, the delete edits the marked text
+        // locally (`super.deleteBackward()`); otherwise it is a real backspace
+        // that must reach the Mac.
+        if commandAccessoryArmed, markedTextRange == nil {
             if !commandAccessorySticky {
                 setCommandAccessoryArmed(false)
             }
@@ -367,7 +416,7 @@ final class TerminalInputTextView: UITextView {
             onEscapeSequence?(Data([0x15]))
             return
         }
-        if alternateAccessoryArmed, markedTextRange == nil, !hasText {
+        if alternateAccessoryArmed, markedTextRange == nil {
             if !alternateAccessorySticky {
                 setAlternateAccessoryArmed(false)
             }
@@ -379,19 +428,36 @@ final class TerminalInputTextView: UITextView {
             }
             return
         }
-        if controlAccessoryArmed, markedTextRange == nil, !hasText {
+        if controlAccessoryArmed, markedTextRange == nil {
             if !controlAccessorySticky {
                 setControlAccessoryArmed(false)
             }
             onBackspace?()
             return
         }
-        if markedTextRange != nil || hasText {
+        // While composing (marked text present), let UITextView edit the marked
+        // string locally so the IME candidate updates; the committed result
+        // still flows to the Mac via the normal insert/textChange path.
+        if markedTextRange != nil {
             super.deleteBackward()
             return
         }
         onBackspace?()
     }
+
+    // MARK: Dictation
+    //
+    // Unlike iSH's `TerminalView` (a raw `UIView` that hand-rolls `UITextInput`
+    // and therefore must provide `insertDictationResultPlaceholder` /
+    // `removeDictationResultPlaceholder`), this view is a `UITextView`, which
+    // already conforms to `UITextInput` and supplies those placeholder methods
+    // as framework witnesses that are not exposed for override. So we inherit
+    // iSH's dictation plumbing for free: when the user taps the keyboard mic,
+    // UIKit drives its own placeholder against this view's text storage and then
+    // delivers the recognized text through the normal `insertText(_:)` /
+    // ``textViewDidChange(_:)`` path, where ``emitCommittedText(_:source:)``
+    // routes the multi-character block through the bracketed-paste sink
+    // (``onPasteText``). There is nothing to override here.
 
     func simulateTextChangeForTesting(_ text: String, isComposing: Bool) {
         self.text = text
@@ -479,16 +545,17 @@ final class TerminalInputTextView: UITextView {
         button.addTarget(self, action: #selector(handleAccessoryButton(_:)), for: .touchUpInside)
         button.accessibilityIdentifier = action.accessibilityIdentifier
         button.accessibilityLabel = action.accessibilityLabel
-        button.titleLabel?.font = Self.accessoryButtonFont
-
-        if let symbolName = action.symbolName {
-            button.setImage(UIImage(systemName: symbolName), for: .normal)
-            button.setPreferredSymbolConfiguration(Self.accessoryButtonSymbolConfig, forImageIn: .normal)
+        applyAccessoryButtonStyle(button, item: .builtin(action), armed: false, sticky: false)
+        button.heightAnchor.constraint(equalToConstant: Self.accessoryButtonHeight).isActive = true
+        if action.isModifier || action.symbolName != nil {
+            // Single-glyph modifiers (⌃⌥⌘⇧) and icon buttons (zoom) get a fixed
+            // width so they stay uniform — their glyph metrics differ, and a
+            // greater-than-or-equal min-width let some (e.g. the glass capsule)
+            // grow wider than others. Variable-text buttons keep growing.
+            button.widthAnchor.constraint(equalToConstant: Self.accessoryButtonMinWidth).isActive = true
         } else {
-            button.setTitle(action.title, for: .normal)
+            button.widthAnchor.constraint(greaterThanOrEqualToConstant: Self.accessoryButtonMinWidth).isActive = true
         }
-
-        applyAccessoryButtonBaseStyle(button)
         return button
     }
 
@@ -498,26 +565,25 @@ final class TerminalInputTextView: UITextView {
         button.addTarget(self, action: #selector(handleAccessoryButton(_:)), for: .touchUpInside)
         button.accessibilityIdentifier = "terminal.inputAccessory.custom.\(custom.id.uuidString)"
         button.accessibilityLabel = custom.title
-        button.titleLabel?.font = Self.accessoryButtonFont
-
+        // Custom actions never arm; they always render in the resting style.
+        applyAccessoryButtonStyle(button, item: .custom(custom), armed: false, sticky: false)
+        button.heightAnchor.constraint(equalToConstant: Self.accessoryButtonHeight).isActive = true
         if let symbolName = custom.symbolName,
            !symbolName.isEmpty,
            UIImage(systemName: symbolName) != nil {
-            button.setImage(UIImage(systemName: symbolName), for: .normal)
-            button.setPreferredSymbolConfiguration(Self.accessoryButtonSymbolConfig, forImageIn: .normal)
-            button.accessibilityLabel = custom.title
+            // Icon-only custom actions match the fixed-width modifier/zoom keys.
+            button.widthAnchor.constraint(equalToConstant: Self.accessoryButtonMinWidth).isActive = true
         } else {
-            button.setTitle(custom.title, for: .normal)
+            // Text custom actions (e.g. "Claude") grow with their title.
+            button.widthAnchor.constraint(greaterThanOrEqualToConstant: Self.accessoryButtonMinWidth).isActive = true
         }
-
-        applyAccessoryButtonBaseStyle(button)
         return button
     }
 
     /// The trailing button that opens the toolbar shortcuts editor. A plain
     /// `UIButton` (not an ``AccessoryActionButton``) so the armed-modifier
-    /// styling/relabel loops skip it, and styled to read as a control rather
-    /// than an insertable key.
+    /// styling/relabel loops skip it, and styled to read as a de-emphasized
+    /// control rather than an insertable key.
     private func makeToolbarSettingsButton() -> UIButton {
         let button = UIButton(type: .system)
         button.translatesAutoresizingMaskIntoConstraints = false
@@ -527,25 +593,100 @@ final class TerminalInputTextView: UITextView {
             localized: "terminal.input_accessory.customize",
             defaultValue: "Customize Toolbar"
         )
-        button.setImage(UIImage(systemName: "slider.horizontal.3"), for: .normal)
-        button.setPreferredSymbolConfiguration(Self.accessoryButtonSymbolConfig, forImageIn: .normal)
-        applyAccessoryButtonBaseStyle(button)
-        button.backgroundColor = .clear
+        // Read as a control, not a glass key: no glass/fill background, a muted
+        // gray tint, and a flat content layout matching the other buttons.
+        var config = UIButton.Configuration.plain()
+        config.image = UIImage(systemName: "slider.horizontal.3")
+        config.preferredSymbolConfigurationForImage = Self.accessoryButtonSymbolConfig
+        config.baseForegroundColor = UIColor(white: 0.7, alpha: 1)
+        config.contentInsets = Self.accessoryButtonContentInsets
+        button.configuration = config
         button.tintColor = UIColor(white: 0.7, alpha: 1)
+        button.heightAnchor.constraint(equalToConstant: Self.accessoryButtonHeight).isActive = true
+        button.widthAnchor.constraint(equalToConstant: Self.accessoryButtonMinWidth).isActive = true
         return button
     }
 
-    private func applyAccessoryButtonBaseStyle(_ button: UIButton) {
-        button.contentEdgeInsets = Self.accessoryButtonInsets
-        button.backgroundColor = Self.accessoryButtonNormalBackground
-        button.setTitleColor(.white, for: .normal)
-        button.tintColor = .white
-        button.layer.cornerRadius = Self.accessoryButtonCornerRadius
-        button.heightAnchor.constraint(equalToConstant: Self.accessoryButtonHeight).isActive = true
-        button.widthAnchor.constraint(greaterThanOrEqualToConstant: Self.accessoryButtonMinWidth).isActive = true
+    /// Build (or rebuild) a button's configuration for `item` and its current
+    /// armed/sticky state. On iOS 26 the bar uses real Liquid Glass
+    /// (`.glass()` resting, `.prominentGlass()` armed/sticky); earlier OSes keep
+    /// the flat gray/blue fill the bar shipped with. Built-in modifier titles
+    /// follow `isMacRemote`; custom actions render their saved title/icon and
+    /// never arm.
+    private func applyAccessoryButtonStyle(
+        _ button: UIButton,
+        item: ResolvedToolbarItem,
+        armed: Bool,
+        sticky: Bool
+    ) {
+        var config = Self.accessoryButtonConfiguration(armed: armed, sticky: sticky)
+        let symbolName: String?
+        let title: String
+        switch item {
+        case let .builtin(action):
+            symbolName = action.symbolName
+            title = action.title(isMacRemote: isMacRemote)
+        case let .custom(custom):
+            // Only honor a custom symbol when it resolves to a real SF Symbol.
+            if let name = custom.symbolName, !name.isEmpty, UIImage(systemName: name) != nil {
+                symbolName = name
+            } else {
+                symbolName = nil
+            }
+            title = custom.title
+        }
+        if let symbolName {
+            config.image = UIImage(systemName: symbolName)
+            config.preferredSymbolConfigurationForImage = Self.accessoryButtonSymbolConfig
+            config.attributedTitle = nil
+        } else {
+            var attributed = AttributedString(title)
+            attributed.font = Self.accessoryButtonFont
+            config.attributedTitle = attributed
+            config.image = nil
+        }
+        config.contentInsets = Self.accessoryButtonContentInsets
+        button.configuration = config
+    }
+
+    private static func accessoryButtonConfiguration(armed: Bool, sticky: Bool) -> UIButton.Configuration {
+        if #available(iOS 26.0, *) {
+            var config: UIButton.Configuration = (armed || sticky) ? .prominentGlass() : .glass()
+            config.baseForegroundColor = .white
+            if armed || sticky {
+                config.baseBackgroundColor = .systemBlue
+            }
+            return config
+        }
+        var config = UIButton.Configuration.plain()
+        var background = UIBackgroundConfiguration.clear()
+        if sticky {
+            background.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.85)
+            background.strokeColor = .white
+            background.strokeWidth = 2
+        } else if armed {
+            background.backgroundColor = .systemBlue
+        } else {
+            background.backgroundColor = accessoryButtonNormalBackground
+        }
+        background.cornerRadius = accessoryButtonCornerRadius
+        config.background = background
+        config.baseForegroundColor = .white
+        return config
     }
 
     private func handleAccessoryAction(_ action: TerminalInputAccessoryAction) {
+        if action == .composer {
+            // Opening the composer hides the accessory bar, so clear any armed
+            // modifier first (like Paste/Zoom do); otherwise a Ctrl/Alt/Cmd/Shift
+            // armed before opening would linger invisibly and modify the next key
+            // after the composer is dismissed.
+            disarmAllModifiers()
+            refreshAccessoryButtonStyles()
+            onToggleComposer?()
+            return
+        }
+
         if action == .paste {
             // Paste is a clipboard read, not a key sequence: ignore any armed
             // modifier and route clipboard content to the host directly.
@@ -613,30 +754,52 @@ final class TerminalInputTextView: UITextView {
 
     /// Read the system clipboard for the Paste button. An image is forwarded via
     /// ``onPasteImage`` (the host uploads it to the Mac as `terminal.paste_image`
-    /// and the Mac injects the resulting file path); plain text rides the normal
-    /// ``onText`` input path. Images win when both are present. A large image
-    /// falls back to JPEG so it stays under the Mac's 10 MB cap. Accessing the
-    /// pasteboard contents here is what shows iOS's one-shot paste banner, which
-    /// is the expected confirmation for an explicit Paste tap.
+    /// and the Mac injects the resulting file path); plain text rides the
+    /// bracketed-paste ``onPasteText`` path (falling back to ``onText`` on a host
+    /// that does not support it) so multi-line clipboard text lands as one paste
+    /// instead of executing line-by-line. Images win when both are present.
+    /// Accessing the pasteboard contents here is what shows iOS's one-shot paste
+    /// banner, which is the expected confirmation for an explicit Paste tap.
+    ///
+    /// The image must fit the mobile sync frame budget once base64-encoded, so we
+    /// try PNG first, then a compressed JPEG, and send the first candidate whose
+    /// actual serialized size fits via ``MobilePasteImageSizing/fits(imageData:)``.
+    /// The base64 frame cap (~8 MB), not the Mac's 10 MB raw clipboard cap, is the
+    /// binding limit because base64 inflates the bytes ~4/3 before they are sent.
+    /// The encoders run lazily and a non-fitting encoding is released before the
+    /// next is produced, so we never hold both the PNG and the JPEG fallback at
+    /// once (a large pasteboard image could otherwise spike memory). If neither
+    /// encoding fits we drop the image and fire ``onPasteImageTooLarge`` so the
+    /// host can tell the user, rather than failing silently.
     private func handlePasteAction() {
         let pasteboard = UIPasteboard.general
         if pasteboard.hasImages, let image = pasteboard.image {
-            let maxImageBytes = 8 * 1024 * 1024
-            if let png = image.pngData(), png.count <= maxImageBytes {
-                onPasteImage?(png, "png")
-                return
+            let sizing = MobilePasteImageSizing()
+            // Measure-then-send: a brief double-encode on an explicit user paste is
+            // fine; this is not a hot path and the lazy encoders keep peak memory
+            // to one encoding at a time.
+            if let fitting = sizing.firstEncodingThatFits([
+                (label: "png", encode: { image.pngData() }),
+                (label: "jpg", encode: { image.jpegData(compressionQuality: 0.8) }),
+            ]) {
+                onPasteImage?(fitting.data, fitting.label)
+            } else {
+                // We have an image but no encoding fits the frame budget; tell the
+                // user instead of silently sending nothing or pasting text.
+                onPasteImageTooLarge?()
             }
-            if let jpeg = image.jpegData(compressionQuality: 0.8) {
-                onPasteImage?(jpeg, "jpg")
-                return
-            }
-            if let png = image.pngData() {
-                onPasteImage?(png, "png")
-                return
-            }
+            return
         }
         if pasteboard.hasStrings, let string = pasteboard.string, !string.isEmpty {
-            onText?(string)
+            // An explicit Paste is always pasted content, so it goes through the
+            // bracketed-paste sink (which falls back to per-key input on a host
+            // that does not support it). The host gates the fallback on the
+            // `terminal.paste.v1` capability.
+            if onPasteText != nil {
+                onPasteText?(string)
+            } else {
+                onText?(string)
+            }
         }
     }
 
@@ -677,23 +840,7 @@ final class TerminalInputTextView: UITextView {
                 armed = false
                 sticky = false
             }
-            if sticky {
-                button.backgroundColor = UIColor.systemBlue.withAlphaComponent(0.85)
-                button.setTitleColor(.white, for: .normal)
-                button.tintColor = .white
-                button.layer.borderWidth = 2
-                button.layer.borderColor = UIColor.white.cgColor
-            } else if armed {
-                button.backgroundColor = .systemBlue
-                button.setTitleColor(.white, for: .normal)
-                button.tintColor = .white
-                button.layer.borderWidth = 0
-            } else {
-                button.backgroundColor = Self.accessoryButtonNormalBackground
-                button.setTitleColor(.white, for: .normal)
-                button.tintColor = .white
-                button.layer.borderWidth = 0
-            }
+            applyAccessoryButtonStyle(button, item: button.item, armed: armed, sticky: sticky)
         }
     }
 
@@ -764,9 +911,28 @@ final class TerminalInputTextView: UITextView {
             if !shiftAccessorySticky {
                 setShiftAccessoryArmed(false)
             }
-            onText?(committedText.uppercased())
+            emitUnmodifiedText(committedText.uppercased())
         } else {
-            onText?(committedText)
+            emitUnmodifiedText(committedText)
+        }
+    }
+
+    /// Route a committed block with no active modifier to either the per-key
+    /// input path or the bracketed-paste path.
+    ///
+    /// Single characters and Return keep riding ``onText`` so byte semantics
+    /// (CR for Return, control bytes, the existing per-keystroke flow) are
+    /// unchanged. A multi-character block — system dictation, an
+    /// autocorrect/predictive replacement, or keyboard-inserted clipboard text —
+    /// is sent through ``onPasteText`` so it reaches the remote terminal as one
+    /// bracketed paste instead of fragmenting on embedded newlines.
+    private func emitUnmodifiedText(_ text: String) {
+        switch TerminalCommitRouter.route(for: text) {
+        case .paste where onPasteText != nil:
+            onPasteText?(text)
+        case .paste, .input:
+            // No paste sink wired (or a single character): per-character input.
+            onText?(text)
         }
     }
 

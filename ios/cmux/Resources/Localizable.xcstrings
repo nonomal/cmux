@@ -1310,6 +1310,23 @@
         }
       }
     },
+    "mobile.paste.imageTooLarge": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Image is too large to paste. Try a smaller image."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "画像が大きすぎて貼り付けできません。小さい画像でお試しください。"
+          }
+        }
+      }
+    },
     "mobile.preview.attachedTerminalName": {
       "extractionState": "manual",
       "localizations": {
@@ -3516,6 +3533,74 @@
           "stringUnit": {
             "state": "translated",
             "value": "ペースト"
+          }
+        }
+      }
+    },
+    "terminal.input_accessory.composer": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Composer"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "メッセージ作成"
+          }
+        }
+      }
+    },
+    "mobile.composer.close": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Hide Composer"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "メッセージ作成を閉じる"
+          }
+        }
+      }
+    },
+    "mobile.composer.placeholder": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Message"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "メッセージ"
+          }
+        }
+      }
+    },
+    "mobile.composer.send": {
+      "extractionState": "manual",
+      "localizations": {
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Send"
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "送信"
           }
         }
       }

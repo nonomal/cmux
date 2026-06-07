@@ -51,6 +51,7 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
 
     private static let terminalRenderGridCapability = "terminal.render_grid.v1"
     private static let workspaceActionsCapability = "workspace.actions.v1"
+    private static let terminalPasteCapability = "terminal.paste.v1"
     private static let terminalOutputCapabilityTimeoutNanoseconds: UInt64 = 750_000_000
 
     /// How long the render-grid stream may stay silent (no event of any topic)
@@ -110,6 +111,22 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     public private(set) var macConnectionStatus: MobileMacConnectionStatus
     public private(set) var connectedHostName: String
     public private(set) var connectionError: String?
+
+    /// Transient notice for a pasted image that could not be sent (too large to
+    /// fit the sync frame, or rejected by the Mac's clipboard-image cap).
+    ///
+    /// Distinct from ``connectionError``: an oversized paste is not a connection
+    /// problem, so it must not drive the connection-recovery banner (Retry / mark
+    /// Mac unavailable). The UI shows this as a short-lived toast and clears it via
+    /// ``dismissPasteImageNotice()``.
+    public private(set) var pasteImageNotice: String?
+
+    /// Monotonic token bumped every time a paste notice is set, even when the
+    /// localized text is identical. The toast keys its auto-dismiss timer on this
+    /// so a second oversized paste restarts the 3-second lifecycle instead of
+    /// being dismissed early by the first paste's still-pending timer.
+    public private(set) var pasteImageNoticeToken: Int = 0
+
     public private(set) var activeTicket: CmxAttachTicket?
     public private(set) var activeRoute: CmxAttachRoute?
 
@@ -170,7 +187,22 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
     /// for older Macs that lack the handler, so the UI can hide rename/pin rather
     /// than offer actions that would fail with `method_not_found`.
     public private(set) var supportsWorkspaceActions: Bool = false
+    /// Whether the connected Mac advertises the `terminal.paste.v1` capability
+    /// (the bracketed-paste `terminal.paste` RPC). `false` until host status is
+    /// read, and for older Macs that lack the handler, so multi-character commits
+    /// (dictation, autocorrect, keyboard/clipboard paste) fall back to per-key
+    /// `terminal.input` instead of being dropped with `method_not_found`.
+    public private(set) var supportsTerminalPaste: Bool = false
     public var terminalInputText: String
+    /// Whether the iMessage-style composer is shown above the terminal. Toggled
+    /// from the input accessory bar's composer button and observed by the
+    /// terminal screen to present ``terminalInputText`` for multi-line editing.
+    public var isComposerPresented: Bool = false
+    /// Guards ``submitComposerInput()`` against re-entrancy. A quick double tap
+    /// on Send would otherwise start two sends that both capture the same text
+    /// (the field is cleared only on ack), pasting the message to the agent
+    /// twice. Not observed: it gates an async flow, not view state.
+    @ObservationIgnored private var isSubmittingComposerInput = false
     public var selectedWorkspaceID: MobileWorkspacePreview.ID? {
         didSet {
             syncSelectedTerminalForWorkspace()
@@ -1472,6 +1504,39 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         await sendRemoteTerminalInput(text + "\r")
     }
 
+    /// Show or hide the iMessage-style composer from the input accessory bar.
+    public func toggleComposer() {
+        isComposerPresented.toggle()
+    }
+
+    /// Submit the composer's text to the selected terminal as a bracketed paste
+    /// plus a single Return, then clear the field while keeping the composer
+    /// open. Unlike ``submitTerminalInput()``, this delivers a multi-line block
+    /// as one paste + one submit (via `terminal.paste`) so interior newlines do
+    /// not fragment into multiple submissions in a TUI agent.
+    ///
+    /// The field is cleared only after the Mac acknowledges the paste. If the
+    /// send fails (no connection, or an older host that does not implement
+    /// `terminal.paste` and answers `method_not_found`), the composed text is
+    /// kept so the user can retry instead of silently losing the message.
+    public func submitComposerInput() async {
+        let text = terminalInputText
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
+        guard remoteClient != nil else { return }
+        // Reject a re-entrant send (e.g. a double tap on Send) so the same text
+        // is not pasted twice. The flag is set/cleared on the main actor around
+        // the await, so no second call can slip past it.
+        guard !isSubmittingComposerInput else { return }
+        isSubmittingComposerInput = true
+        defer { isSubmittingComposerInput = false }
+        let sent = await sendRemoteTerminalPaste(text, submitKey: "return")
+        // Only clear if the field still holds exactly what we sent, so a value
+        // the user typed while the send was in flight is not discarded.
+        if sent, terminalInputText == text {
+            terminalInputText = ""
+        }
+    }
+
     public func sendTerminalRawInput(_ text: String) {
         #if DEBUG
         mobileShellLog.debug("enqueue raw terminal input byteCount=\(text.utf8.count, privacy: .public)")
@@ -1549,6 +1614,43 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         guard !text.isEmpty else { return }
         guard remoteClient != nil else { return }
         await sendRemoteTerminalInput(text, workspaceID: workspaceID, terminalID: terminalID)
+    }
+
+    /// Send a committed block of text (system dictation, an autocorrect
+    /// replacement, or keyboard-inserted clipboard text) to the terminal that
+    /// owns `surfaceID` as a *bracketed paste*.
+    ///
+    /// Unlike ``submitTerminalRawInput(_:surfaceID:)``, this routes to the
+    /// Mac's `terminal.paste` RPC, which delivers the text through Ghostty's
+    /// paste path (`ghostty_surface_text`). That keeps embedded newlines part of
+    /// one paste so a running shell or TUI does not execute each line as a
+    /// separate command, and lets bracketed-paste-aware programs treat it as
+    /// pasted content.
+    /// - Parameters:
+    ///   - text: The committed block. Sent verbatim; the Mac applies bracketed
+    ///     paste framing.
+    ///   - surfaceID: The terminal surface id the block targets.
+    public func submitTerminalPasteText(_ text: String, surfaceID: String) async {
+        guard !text.isEmpty else { return }
+        let workspaceCandidate = workspaces.first(where: { workspace in
+            workspace.terminals.contains(where: { $0.id.rawValue == surfaceID })
+        })
+        guard let workspace = workspaceCandidate else { return }
+        guard remoteClient != nil else { return }
+        let terminalID = MobileTerminalPreview.ID(rawValue: surfaceID)
+        // Fall back to per-key input when the paired Mac is too old to advertise
+        // the bracketed-paste RPC, so a new client + old host drops nothing.
+        // `terminal.input` expects CR for Return, so normalize newlines.
+        guard supportsTerminalPaste else {
+            let normalized = text.replacingOccurrences(of: "\n", with: "\r")
+            await submitTerminalRawInput(normalized, workspaceID: workspace.id, terminalID: terminalID)
+            return
+        }
+        await sendRemoteTerminalPasteText(
+            text,
+            workspaceID: workspace.id,
+            terminalID: terminalID
+        )
     }
 
     private func drainRawTerminalInputBuffer() async {
@@ -1831,6 +1933,9 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         terminalReplaySurfaceIDsInFlight = []
         terminalOutputTransport = .rawBytes
         supportsWorkspaceActions = false
+        // Clear paste support too, so a reconnect to an older host cannot send
+        // `terminal.paste` on a stale `true` before the next status probe lands.
+        supportsTerminalPaste = false
         terminalSubscriptionRefreshTask?.cancel()
         terminalSubscriptionRefreshTask = nil
         stopRenderGridLivenessWatchdog(listenerID: nil)
@@ -2175,6 +2280,168 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
             handleTerminalInputResponse(responseData, surfaceID: terminalID.rawValue)
         } catch {
             guard generation == connectionGeneration else { return }
+            // An oversized image is a paste problem, not a connection problem:
+            // route it to the transient paste notice instead of tearing down or
+            // showing the connection-recovery banner.
+            if Self.isPasteImageTooLargeError(error) {
+                setPasteImageTooLargeNotice()
+                return
+            }
+            guard !disconnectForAuthorizationFailureIfNeeded(error) else { return }
+            markMacConnectionUnavailableIfNeeded(after: error)
+            connectionError = Self.localizedConnectionError(for: error)
+        }
+    }
+
+    /// Whether `error` means a pasted image was rejected for being too large,
+    /// either locally (the base64 JSON overflowed the sync frame cap) or by the
+    /// Mac (its 10 MB clipboard-image cap, surfaced as an `invalid_params`
+    /// RPC error from `terminal.paste_image`).
+    private static func isPasteImageTooLargeError(_ error: any Error) -> Bool {
+        if case MobileSyncFrameCodecError.frameTooLarge = error {
+            return true
+        }
+        if let connectionError = error as? MobileShellConnectionError,
+           case let .rpcError(_, message) = connectionError,
+           message.localizedCaseInsensitiveContains("size limit") {
+            return true
+        }
+        return false
+    }
+
+    /// Surface the "image too large" notice triggered by the iOS-side size check,
+    /// before any frame is sent (every encoding overflowed the frame budget).
+    public func reportPasteImageTooLarge() {
+        setPasteImageTooLargeNotice()
+    }
+
+    /// Clear the transient paste-image notice (e.g. when its toast auto-dismisses
+    /// or the user taps it away).
+    public func dismissPasteImageNotice() {
+        pasteImageNotice = nil
+    }
+
+    /// Single setter for the too-large notice so the iOS-side pre-send check and
+    /// the Mac-side RPC rejection both surface identical, localized feedback.
+    private func setPasteImageTooLargeNotice() {
+        pasteImageNotice = L10n.string(
+            "mobile.paste.imageTooLarge",
+            defaultValue: "Image is too large to paste. Try a smaller image."
+        )
+        pasteImageNoticeToken &+= 1
+    }
+
+    /// - Returns: `true` when the Mac acknowledged the paste, `false` when there
+    ///   is no selected workspace/terminal or the send failed.
+    @discardableResult
+    private func sendRemoteTerminalPaste(_ text: String, submitKey: String) async -> Bool {
+        guard let workspaceID = selectedWorkspace?.id,
+              let terminalID = selectedTerminalID else {
+            #if DEBUG
+            mobileShellLog.info("skip remote terminal paste selectedWorkspace=\(self.selectedWorkspace == nil ? 0 : 1, privacy: .public) selectedTerminal=\(self.selectedTerminalID == nil ? 0 : 1, privacy: .public)")
+            #endif
+            return false
+        }
+        return await sendRemoteTerminalPaste(text, submitKey: submitKey, workspaceID: workspaceID, terminalID: terminalID)
+    }
+
+    /// Deliver a composed block to the Mac surface via `terminal.paste`: a
+    /// bracketed paste (so multi-line text is inserted as one literal block)
+    /// followed by an optional submit key. Mirrors ``sendRemoteTerminalInput(_:workspaceID:terminalID:)``
+    /// but takes the dedicated paste path instead of the raw `terminal.input`
+    /// path, which rewrites newlines to carriage returns.
+    ///
+    /// - Returns: `true` when the Mac acknowledged the paste, `false` on any
+    ///   failure (no client, a stale generation, or an RPC error such as
+    ///   `method_not_found` from an older host). Callers use this to keep the
+    ///   composer text on failure instead of clearing it optimistically.
+    @discardableResult
+    private func sendRemoteTerminalPaste(
+        _ text: String,
+        submitKey: String,
+        workspaceID: MobileWorkspacePreview.ID,
+        terminalID: MobileTerminalPreview.ID
+    ) async -> Bool {
+        guard let client = remoteClient else {
+            #if DEBUG
+            mobileShellLog.info("skip remote terminal paste remoteClient=0")
+            #endif
+            return false
+        }
+        let generation = connectionGeneration
+        do {
+            #if DEBUG
+            mobileShellLog.debug("send remote terminal paste byteCount=\(text.utf8.count, privacy: .public) submit=\(submitKey, privacy: .public) workspace=\(workspaceID.rawValue, privacy: .private) terminal=\(terminalID.rawValue, privacy: .private)")
+            #endif
+            let key = viewportKey(workspaceID: workspaceID, terminalID: terminalID)
+            var params: [String: Any] = [
+                "workspace_id": workspaceID.rawValue,
+                "surface_id": terminalID.rawValue,
+                "text": text,
+                "submit_key": submitKey,
+                "client_id": clientID,
+            ]
+            if let viewportSize = reportedViewportSizesByTerminalKey[key] {
+                params["viewport_columns"] = viewportSize.columns
+                params["viewport_rows"] = viewportSize.rows
+            }
+            let responseData = try await client.sendRequest(
+                MobileCoreRPCClient.requestData(
+                    method: "terminal.paste",
+                    params: params
+                )
+            )
+            guard isCurrentRemoteOperation(client: client, generation: generation) else { return false }
+            handleTerminalInputResponse(responseData, surfaceID: terminalID.rawValue)
+            return true
+        } catch {
+            guard generation == connectionGeneration else { return false }
+            guard !disconnectForAuthorizationFailureIfNeeded(error) else { return false }
+            markMacConnectionUnavailableIfNeeded(after: error)
+            connectionError = Self.localizedConnectionError(for: error)
+            return false
+        }
+    }
+
+    /// Deliver a committed text block (system dictation, an autocorrect/predictive
+    /// replacement, or keyboard-inserted clipboard text) to the Mac surface as a
+    /// bracketed paste *without* submitting. Routes through the same canonical
+    /// `terminal.paste` RPC as the composer, passing `submit_key: "none"` so the
+    /// host inserts the block verbatim and leaves the cursor in place (no Return),
+    /// matching the per-key input behavior the keyboard would otherwise produce.
+    private func sendRemoteTerminalPasteText(
+        _ text: String,
+        workspaceID: MobileWorkspacePreview.ID,
+        terminalID: MobileTerminalPreview.ID
+    ) async {
+        guard let client = remoteClient else { return }
+        let generation = connectionGeneration
+        do {
+            #if DEBUG
+            mobileShellLog.debug("send remote terminal paste text byteCount=\(text.utf8.count, privacy: .public) workspace=\(workspaceID.rawValue, privacy: .private) terminal=\(terminalID.rawValue, privacy: .private)")
+            #endif
+            let key = viewportKey(workspaceID: workspaceID, terminalID: terminalID)
+            var params: [String: Any] = [
+                "workspace_id": workspaceID.rawValue,
+                "surface_id": terminalID.rawValue,
+                "text": text,
+                "submit_key": "none",
+                "client_id": clientID,
+            ]
+            if let viewportSize = reportedViewportSizesByTerminalKey[key] {
+                params["viewport_columns"] = viewportSize.columns
+                params["viewport_rows"] = viewportSize.rows
+            }
+            let responseData = try await client.sendRequest(
+                MobileCoreRPCClient.requestData(
+                    method: "terminal.paste",
+                    params: params
+                )
+            )
+            guard isCurrentRemoteOperation(client: client, generation: generation) else { return }
+            handleTerminalInputResponse(responseData, surfaceID: terminalID.rawValue)
+        } catch {
+            guard generation == connectionGeneration else { return }
             guard !disconnectForAuthorizationFailureIfNeeded(error) else { return }
             markMacConnectionUnavailableIfNeeded(after: error)
             connectionError = Self.localizedConnectionError(for: error)
@@ -2238,9 +2505,11 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
             guard let payload = try? MobileHostStatusResponse.decode(data) else {
                 terminalOutputTransport = fallback
                 supportsWorkspaceActions = false
+                supportsTerminalPaste = false
                 return fallback
             }
             supportsWorkspaceActions = payload.capabilities.contains(Self.workspaceActionsCapability)
+            supportsTerminalPaste = payload.capabilities.contains(Self.terminalPasteCapability)
             let transport: TerminalOutputTransport = payload.capabilities.contains(Self.terminalRenderGridCapability) ||
                 payload.terminalFidelity == "render_grid" ? .renderGrid : .rawBytes
             terminalOutputTransport = transport
@@ -2249,6 +2518,7 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         } catch {
             terminalOutputTransport = fallback
             supportsWorkspaceActions = false
+            supportsTerminalPaste = false
             MobileDebugLog.anchormux("sync.transport=raw_bytes reason=status_failed")
             return fallback
         }
