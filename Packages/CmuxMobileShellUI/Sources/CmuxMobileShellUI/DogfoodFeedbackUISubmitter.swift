@@ -55,9 +55,11 @@ final class DogfoodFeedbackUISubmitter: DogfoodFeedbackSubmitting {
     /// window is found or the render fails.
     ///
     /// The dogfood pane is now an in-hierarchy `.overlay` (not a separate
-    /// window), so the small bug pill rides along in the corner of the shot. That
-    /// is an accepted DEV-only cosmetic; the alternative was the hand-rolled
-    /// passthrough window whose `hitTest` killed the pill's tap + drag.
+    /// window), so the pane renders into this same window and appears in the shot.
+    /// At Capture & Send the pane is expanded, so the shot includes the full
+    /// feedback card (the old passthrough-window approach excluded it). That is an
+    /// accepted DEV-only cosmetic; the alternative was the hand-rolled passthrough
+    /// window whose `hitTest` killed the pill's tap + drag.
     private static func captureChromeScreenshotPNG() -> Data? {
         guard let scene = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene })
