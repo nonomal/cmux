@@ -499,11 +499,22 @@ public enum TerminalInputAccessoryAction: Int, CaseIterable, Sendable {
         }
     }
 
-    /// Whether the user can show/hide/reorder this action. The modifier keys
-    /// (⌃ ⌥ ⌘ ⇧) and zoom controls are structural and stay pinned, so only the
-    /// insertable shortcuts (those with an `output`) are configurable.
+    /// Whether the user can show/hide/reorder this action.
+    ///
+    /// Every button on the bar is configurable except ``shift`` and ``composer``,
+    /// which have armed machinery but are intentionally not surfaced as bar
+    /// buttons (``composer`` is the iMessage-style composer toggle, not a normal
+    /// shortcut). The leading modifier keys (⌃ ⌥ ⌘), zoom controls, and paste used
+    /// to be structurally pinned; they are now part of the user-configurable
+    /// region too, so their position can be moved alongside the insertable
+    /// shortcuts.
     public var isUserConfigurable: Bool {
-        output != nil && !isModifier
+        switch self {
+        case .shift, .composer:
+            return false
+        default:
+            return true
+        }
     }
 
     /// Every user-configurable action in canonical (enum) order. This is the full
@@ -513,19 +524,36 @@ public enum TerminalInputAccessoryAction: Int, CaseIterable, Sendable {
         allCases.filter { $0.isUserConfigurable }
     }
 
-    /// The default on-bar arrangement of the configurable shortcuts: the
-    /// high-traffic agent and control keys first (Tab then Esc, ^C/^D, the
-    /// Claude/Codex launchers, the arrow keys, Clear), then the punctuation and
-    /// navigation keys. Esc sits immediately to the right of Tab so the two most
-    /// common terminal keys are adjacent. Curated independently of the enum's
-    /// `rawValue` order so the default bar can be arranged without perturbing the
-    /// persisted identifiers, which are the `rawValue`s.
+    /// The configurable actions that previously sat in the bar's fixed leading
+    /// region, in their shipped left-to-right order. They lead ``defaultConfigurableOrder``
+    /// on a fresh install, and the v1/v2→v3 migration force-enables and inserts
+    /// them at the front so an upgrading user's bar looks unchanged.
+    public static var defaultLeadingActions: [TerminalInputAccessoryAction] {
+        [.control, .alternate, .command, .paste]
+    }
+
+    /// The configurable actions that previously sat in the bar's fixed trailing
+    /// region (the zoom controls). They tail ``defaultConfigurableOrder`` on a
+    /// fresh install, and the migration force-enables and appends them so an
+    /// upgrading user's bar looks unchanged.
+    public static var defaultTrailingActions: [TerminalInputAccessoryAction] {
+        [.zoomOut, .zoomIn]
+    }
+
+    /// The default on-bar arrangement of the configurable shortcuts: the leading
+    /// modifier/paste controls, then the high-traffic agent and control keys (Tab,
+    /// Esc, ^C/^D, the Claude/Codex launchers, the arrow keys, Clear), then the
+    /// punctuation and navigation keys, then the trailing zoom controls. Esc sits
+    /// immediately to the right of Tab so the two most common terminal keys are
+    /// adjacent. Curated independently of the enum's `rawValue` order so the
+    /// default bar can be arranged without perturbing the persisted identifiers,
+    /// which are the `rawValue`s.
     ///
     /// Must stay a permutation of ``configurableActions``;
     /// ``TerminalAccessoryLayoutReducer`` defensively appends any omission, so a
     /// gap here can never drop an action from the bar.
     public static var defaultConfigurableOrder: [TerminalInputAccessoryAction] {
-        [
+        defaultLeadingActions + [
             .tab,
             .escape,
             .ctrlC, .ctrlD,
@@ -535,7 +563,7 @@ public enum TerminalInputAccessoryAction: Int, CaseIterable, Sendable {
             .tilde, .dollar, .slash, .atSign, .pipe,
             .ctrlZ,
             .home, .end, .pageUp, .pageDown,
-        ]
+        ] + defaultTrailingActions
     }
 
     /// Human-readable name for the shortcuts settings editor (the bar itself
@@ -564,7 +592,12 @@ public enum TerminalInputAccessoryAction: Int, CaseIterable, Sendable {
         case .pageUp: return String(localized: "terminal.shortcut.name.pageUp", defaultValue: "Page Up")
         case .pageDown: return String(localized: "terminal.shortcut.name.pageDown", defaultValue: "Page Down")
         case .paste: return String(localized: "terminal.input_accessory.paste", defaultValue: "Paste")
-        case .control, .alternate, .command, .shift, .zoomIn, .zoomOut, .composer:
+        case .control: return String(localized: "terminal.shortcut.name.control", defaultValue: "Control")
+        case .alternate: return String(localized: "terminal.shortcut.name.alternate", defaultValue: "Option")
+        case .command: return String(localized: "terminal.shortcut.name.command", defaultValue: "Command")
+        case .zoomIn: return String(localized: "terminal.input_accessory.zoom_in", defaultValue: "Zoom In")
+        case .zoomOut: return String(localized: "terminal.input_accessory.zoom_out", defaultValue: "Zoom Out")
+        case .shift, .composer:
             return title
         }
     }
