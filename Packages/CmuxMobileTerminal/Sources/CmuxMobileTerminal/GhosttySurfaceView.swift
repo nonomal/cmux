@@ -989,6 +989,14 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
                     b: frOwner.rawValue
                 ))
                 #endif
+                // The user tapped "hide keyboard" while composing, so they want the
+                // keyboard DOWN. The composer's hosted field (not `inputProxy`) holds
+                // first responder, so resign it here to start the keyboard hide; that
+                // drops `keyboardHeight` to 0 before the composer's own teardown runs,
+                // so `setComposerActive(false)`'s re-focus guard (`keyboardHeight > 0`)
+                // correctly skips re-summoning the keyboard. Then dismiss the composer
+                // so the two states collapse together.
+                self.composerContainer.endEditing(true)
                 self.delegate?.ghosttySurfaceViewDidRequestComposerDismiss(self)
                 return
             }
@@ -1417,12 +1425,22 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
     ///   proxy. The composer's hosted text field becomes first responder while this
     ///   keyboard is still up, so iOS hands the keyboard over in place. Resigning
     ///   first tore the keyboard down and the composer re-summoned it (a flicker).
-    /// - Closing (`active == false`): the composer's field is being torn out of the
-    ///   hierarchy and resigns first responder, with nothing to take it back, so the
-    ///   keyboard would animate down. Re-take it on the terminal input proxy in the
-    ///   same update so some responder is always first responder at runloop end and
-    ///   the keyboard hands back in place instead of dropping. No sleep /
-    ///   `asyncAfter`: the `become` is issued synchronously here.
+    /// - Closing (`active == false`): two distinct intents share this path, told
+    ///   apart by ``keyboardHeight``:
+    ///   - Toggle-close (the chevron tapped while typing): `keyboardHeight > 0`. The
+    ///     user wants to keep the keyboard. The composer's field resigns first
+    ///     responder as it is torn out, with nothing to take it back, so re-take it on
+    ///     the terminal input proxy in the same update — some responder is always first
+    ///     responder at runloop end and the keyboard hands back in place instead of
+    ///     dropping.
+    ///   - Collapse-close (the keyboard already went down — swipe, hardware keyboard,
+    ///     backgrounding, or the hide-keyboard button — which routes through
+    ///     ``ghosttySurfaceViewDidCollapseKeyboard(_:)`` → `dismissComposer`):
+    ///     `keyboardHeight == 0`. The user wants the keyboard DOWN, so do NOT re-focus
+    ///     the proxy; that would re-summon the keyboard and defeat
+    ///     `composerPresented ⇒ keyboardUp`. Gating the re-focus on `keyboardHeight > 0`
+    ///     is what makes that invariant hold in BOTH directions.
+    ///   No sleep / `asyncAfter`: the `become` is issued synchronously here.
     public func setComposerActive(_ active: Bool) {
         guard composerActive != active else { return }
         composerActive = active
@@ -1435,15 +1453,15 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
             // height arrives separately via `setComposerBandHeight(_:animated:)` once
             // the host mounts and measures the field.
         } else {
-            // Closing: the composer's field is being torn out of the hierarchy and
-            // resigns first responder, with nothing to take it back, so the keyboard
-            // would animate down. Re-take it on the terminal input proxy in the same
-            // update so some responder is always first responder at runloop end and
-            // the keyboard hands back in place instead of dropping. The host animates
-            // the band height back to 0 on unmount (`setComposerBandHeight(0,
-            // animated:)`), so the band shrink and the keyboard handover read as one
-            // motion; do NOT snap it to 0 here or that pre-empts the animation.
-            if window != nil, !isDismantled, !inputProxy.isFirstResponder {
+            // Closing: re-take first responder on the terminal input proxy ONLY for a
+            // toggle-close (keyboard still up, `keyboardHeight > 0`) so the keyboard
+            // hands back in place instead of dropping. For a collapse-close (keyboard
+            // already down) re-focusing would re-summon the keyboard, so skip it — that
+            // is the structural enforcement of `composerPresented ⇒ keyboardUp`. The
+            // host animates the band height back to 0 on unmount, so the band shrink
+            // reads as one motion; do NOT snap it to 0 here or that pre-empts the
+            // animation.
+            if keyboardHeight > 0, window != nil, !isDismantled, !inputProxy.isFirstResponder {
                 Self.activeInputSurface = self
                 inputProxy.updateAccessoryLayoutInsets()
                 inputProxy.becomeFirstResponder()
