@@ -233,18 +233,14 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
     private static let accessoryButtonCornerRadius: CGFloat = 6
     private static let accessoryButtonHeight: CGFloat = 28
     /// Fixed height of the docked bar's button row, pinned to the container's top.
-    /// Sized to hug the tallest control (the 34pt arrow nub) plus a small top/bottom
-    /// breathing inset, NOT the full 44pt the grid reserves. Keeping the strip tight
-    /// and top-pinned means the buttons sit flush under the terminal's last row; the
-    /// remaining bar height the host adds (the reserved-vs-strip difference plus any
-    /// sub-cell render slack) falls BELOW the buttons, where it reads as the bar's
-    /// own background instead of a gap above the toolbar. Round 2 left ~8pt of bar
-    /// above the buttons because they were centered in the full-height strip; this
-    /// removes that band.
-    static let dockedButtonRowHeight: CGFloat = 38
-    /// Small top inset for the controls inside the docked button strip so they do
-    /// not touch the very top pixel while still hugging the terminal's last row.
-    private static let dockedButtonRowTopInset: CGFloat = 2
+    /// Sized to exactly the tallest control (the 34pt arrow nub), NOT the full 44pt
+    /// the grid reserves. The controls center on this tight strip, so they sit flush
+    /// near the bar's top (a few points below the terminal's last row) on one shared
+    /// centerline, and the remaining bar height the host adds (reserved-vs-strip
+    /// difference plus any sub-cell render slack) falls BELOW them, reading as the
+    /// bar's own background rather than a gap above the toolbar. Round 2 left ~8pt of
+    /// bar above the buttons because they centered in the full-height strip.
+    static let dockedButtonRowHeight: CGFloat = 34
     /// Minimum (not fixed) button width. Text buttons (Tab, Esc, ^C, ^D) size to
     /// their intrinsic content width and only floor here so they hug their label
     /// plus the comfortable inset; single-glyph modifiers/icons take a fixed width
@@ -320,13 +316,14 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
             constant: 0
         )
 
-        // A fixed-height strip pinned to the container's TOP that holds the actual
+        // A short fixed-height strip pinned to the container's TOP that holds the
         // button row. The docked container can be taller than this strip: the host
         // (`GhosttySurfaceView.dockedToolbarFrame`) anchors the bar's top to the
         // rendered terminal's bottom and lets it grow downward to the keyboard
-        // edge, so the sub-cell slack is absorbed *below* this strip. Pinning the
-        // buttons to a top strip (instead of the container's centerY) keeps them
-        // flush under the terminal's last row no matter how tall the bar grows.
+        // edge, so the sub-cell slack is absorbed *below* this strip. Centering the
+        // controls on this short top strip (rather than on the full-height
+        // container) keeps them flush near the terminal's last row no matter how
+        // tall the bar grows.
         let buttonRow = UILayoutGuide()
         container.addLayoutGuide(buttonRow)
 
@@ -341,23 +338,24 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
             buttonRow.trailingAnchor.constraint(equalTo: container.trailingAnchor),
             buttonRow.heightAnchor.constraint(equalToConstant: Self.dockedButtonRowHeight),
 
-            // Top-align every control inside the strip (a small inset for breathing
-            // room) so they hug the bar's top edge — i.e. flush under the terminal's
-            // last row. The 28pt-tall buttons would sit ~5pt low if centered, which
-            // is the residual band round 2 complained about.
+            // Every control shares the strip's single centerline. The strip is sized
+            // to the tallest control (the 34pt nub), so centering keeps all three
+            // groups — keyboard button, nub, and the scrollable Ctrl/Esc/Tab row —
+            // on ONE horizontal line, flush near the bar's top. (Top-pinning the
+            // directly-anchored controls instead would float them above the
+            // scroll row, which is centered inside its own scroll view.)
             dismissLeadingConstraint,
-            dismissButton.topAnchor.constraint(equalTo: buttonRow.topAnchor, constant: Self.dockedButtonRowTopInset),
+            dismissButton.centerYAnchor.constraint(equalTo: buttonRow.centerYAnchor),
             dismissButton.widthAnchor.constraint(equalToConstant: 32),
-            dismissButton.heightAnchor.constraint(equalToConstant: Self.accessoryButtonHeight),
 
             nub.leadingAnchor.constraint(equalTo: dismissButton.trailingAnchor, constant: 6),
-            nub.topAnchor.constraint(equalTo: buttonRow.topAnchor, constant: Self.dockedButtonRowTopInset),
+            nub.centerYAnchor.constraint(equalTo: buttonRow.centerYAnchor),
             nub.widthAnchor.constraint(equalToConstant: 34),
             nub.heightAnchor.constraint(equalToConstant: 34),
 
             scrollView.leadingAnchor.constraint(equalTo: nub.trailingAnchor, constant: 6),
             scrollTrailingConstraint,
-            scrollView.topAnchor.constraint(equalTo: buttonRow.topAnchor, constant: Self.dockedButtonRowTopInset),
+            scrollView.topAnchor.constraint(equalTo: buttonRow.topAnchor),
             scrollView.bottomAnchor.constraint(equalTo: buttonRow.bottomAnchor),
 
             stack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 2),
