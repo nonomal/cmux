@@ -1310,12 +1310,38 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
     /// bottom edge (when down). It intentionally does NOT reserve the bottom
     /// safe area: the toolbar IS the bottom chrome, so the home indicator simply
     /// overlays its lower edge (like a system tab bar) instead of leaving an
-    /// empty strip below it. Mirrors the `bottomInset` math in
-    /// `syncSurfaceGeometry` so the toolbar top equals the grid bottom exactly.
+    /// empty strip below it.
+    ///
+    /// The bar's TOP is anchored to the rendered terminal's bottom edge
+    /// (`lastRenderRect.maxY`), not the reserved grid bottom. libghostty floors
+    /// the grid to whole cells and top-anchors the render, so the reserved
+    /// container is up to ~one cell taller than the rendered content; pinning the
+    /// bar to the reserved bottom (`bounds.height - 44 - keyboard`) left that
+    /// sub-cell remainder as a visible terminal-background gap between the last
+    /// row and the toolbar. Anchoring to `lastRenderRect.maxY` instead makes the
+    /// buttons sit flush under the last terminal row, and the bar grows DOWNWARD
+    /// to the keyboard edge so the sub-cell slack is absorbed *below* the buttons
+    /// (covered by the bar's own background) rather than shown above them. The
+    /// buttons themselves are top-aligned in the bar (see the accessory toolbar's
+    /// stack constraints) so they hug that top edge. Falls back to the reserved
+    /// bottom before the first geometry pass measures `lastRenderRect`.
     private func dockedToolbarFrame() -> CGRect {
         let occupied = max(0, keyboardHeight)
-        let height = Self.persistentToolbarHeight
-        return CGRect(x: 0, y: bounds.height - height - occupied, width: bounds.width, height: height)
+        let bottomEdge = bounds.height - occupied
+        // The grid reserves `persistentToolbarHeight`, so the rendered terminal's
+        // bottom sits at or above this line; it is the fallback top before
+        // geometry measures `lastRenderRect`.
+        let reservedTop = bottomEdge - Self.persistentToolbarHeight
+        // Anchor the bar's top to the rendered terminal's bottom edge when
+        // measured. Because libghostty floors the grid to whole cells and
+        // top-anchors it, `lastRenderRect.maxY` is at or ABOVE `reservedTop` by the
+        // sub-cell remainder, so the bar moves UP to hug the last row and grows
+        // taller toward the keyboard edge (the slack is absorbed below the button
+        // row, which is top-pinned inside the bar). Never let the top drop below
+        // `reservedTop` (that would re-open the gap) and never go negative.
+        let renderBottom = lastRenderRect.isEmpty ? reservedTop : lastRenderRect.maxY
+        let top = max(0, min(renderBottom, reservedTop))
+        return CGRect(x: 0, y: top, width: bounds.width, height: bottomEdge - top)
     }
 
     private func layoutDockedToolbar() {
@@ -2528,6 +2554,11 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         let renderRect = result.pinnedSize.map { CGRect(origin: .zero, size: $0) }
             ?? CGRect(origin: .zero, size: naturalRenderSize)
         lastRenderRect = renderRect
+        // The docked toolbar's top hugs `lastRenderRect.maxY` (see
+        // `dockedToolbarFrame`), so re-seat it now that the rendered terminal
+        // bottom has moved; otherwise the bar keeps the pre-geometry position and
+        // the sub-cell gap above it reappears.
+        layoutDockedToolbar()
         MobileDebugLog.anchormux(
             "geom container=\(Int(containerW))x\(Int(containerH)) scale=\(scale) "
             + "cellPx=\(Int(result.cellPixelSize.width))x\(Int(result.cellPixelSize.height)) "

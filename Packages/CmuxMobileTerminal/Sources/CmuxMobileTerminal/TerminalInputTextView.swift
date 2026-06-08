@@ -232,6 +232,11 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
     private static let accessoryButtonContentInsets = NSDirectionalEdgeInsets(top: 5, leading: 8, bottom: 5, trailing: 8)
     private static let accessoryButtonCornerRadius: CGFloat = 6
     private static let accessoryButtonHeight: CGFloat = 28
+    /// Fixed height of the docked bar's button row, pinned to the container's top.
+    /// Matches `GhosttySurfaceView.persistentToolbarHeight` (the height the grid
+    /// reserves) so the buttons occupy exactly the reserved strip and any extra
+    /// container height the host adds (sub-cell render slack) falls below them.
+    static let dockedButtonRowHeight: CGFloat = 44
     /// Minimum (not fixed) button width. Text buttons (Tab, Esc, ^C, ^D) size to
     /// their intrinsic content width and only floor here so they hug their label
     /// plus the comfortable inset; single-glyph modifiers/icons take a fixed width
@@ -307,25 +312,40 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
             constant: 0
         )
 
+        // A fixed-height strip pinned to the container's TOP that holds the actual
+        // button row. The docked container can be taller than this strip: the host
+        // (`GhosttySurfaceView.dockedToolbarFrame`) anchors the bar's top to the
+        // rendered terminal's bottom and lets it grow downward to the keyboard
+        // edge, so the sub-cell slack is absorbed *below* this strip. Pinning the
+        // buttons to a top strip (instead of the container's centerY) keeps them
+        // flush under the terminal's last row no matter how tall the bar grows.
+        let buttonRow = UILayoutGuide()
+        container.addLayoutGuide(buttonRow)
+
         NSLayoutConstraint.activate([
             backgroundLeadingConstraint,
             backgroundTrailingConstraint,
             backgroundView.topAnchor.constraint(equalTo: container.topAnchor),
             backgroundView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
 
+            buttonRow.topAnchor.constraint(equalTo: container.topAnchor),
+            buttonRow.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+            buttonRow.trailingAnchor.constraint(equalTo: container.trailingAnchor),
+            buttonRow.heightAnchor.constraint(equalToConstant: Self.dockedButtonRowHeight),
+
             dismissLeadingConstraint,
-            dismissButton.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            dismissButton.centerYAnchor.constraint(equalTo: buttonRow.centerYAnchor),
             dismissButton.widthAnchor.constraint(equalToConstant: 32),
 
             nub.leadingAnchor.constraint(equalTo: dismissButton.trailingAnchor, constant: 6),
-            nub.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+            nub.centerYAnchor.constraint(equalTo: buttonRow.centerYAnchor),
             nub.widthAnchor.constraint(equalToConstant: 34),
             nub.heightAnchor.constraint(equalToConstant: 34),
 
             scrollView.leadingAnchor.constraint(equalTo: nub.trailingAnchor, constant: 6),
             scrollTrailingConstraint,
-            scrollView.topAnchor.constraint(equalTo: container.topAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+            scrollView.topAnchor.constraint(equalTo: buttonRow.topAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: buttonRow.bottomAnchor),
 
             stack.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor, constant: 2),
             stack.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor, constant: -2),

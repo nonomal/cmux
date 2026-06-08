@@ -16,9 +16,11 @@ import SwiftUI
 struct DogfoodPaneOverlayView: View {
     @Bindable var model: DogfoodFeedbackModel
 
-    /// The pill's free-drag offset from its default bottom-trailing anchor.
+    /// The pill's free-drag offset from its default top-leading anchor.
     @State private var dragOffset: CGSize = .zero
-    @State private var accumulatedOffset: CGSize = CGSize(width: -16, height: -120)
+    /// Default resting position: top-left of the screen, just inside the safe
+    /// area. Positive width moves right, positive height moves down.
+    @State private var accumulatedOffset: CGSize = CGSize(width: 16, height: 64)
     /// True while the reposition ``DragGesture`` is active; drives the pill's
     /// lifted scale/stroke. The `TapGesture` and `DragGesture` are independent, so
     /// this no longer gates tap-to-expand — it is purely a visual cue.
@@ -26,7 +28,7 @@ struct DogfoodPaneOverlayView: View {
 
     var body: some View {
         GeometryReader { proxy in
-            ZStack(alignment: .bottomTrailing) {
+            ZStack(alignment: .topLeading) {
                 // Transparent backdrop: hit-tests off so taps fall through to the
                 // app window beneath this overlay window.
                 Color.clear
@@ -37,9 +39,23 @@ struct DogfoodPaneOverlayView: View {
                         .frame(maxWidth: min(360, proxy.size.width - 24))
                         .padding(12)
                         .transition(.scale(scale: 0.92).combined(with: .opacity))
+                        // Publish the card's window-space frame so the passthrough
+                        // window makes the whole card hittable while expanded.
+                        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { rect in
+                            model.interactiveFrame = rect
+                        }
                 } else {
                     pill
                         .offset(currentOffset(in: proxy.size))
+                        // Publish the pill's window-space frame so the passthrough
+                        // window's `hitTest` can return real hits for exactly this
+                        // region (and pass everything else through to the app). This
+                        // is what makes BOTH the tap and the drag work: without a
+                        // positive region the window either swallowed every touch or
+                        // rejected the pill's own gestures.
+                        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { rect in
+                            model.interactiveFrame = rect
+                        }
                         // Two cooperating recognizers: a `DragGesture` with a real
                         // movement threshold repositions the pill, and a
                         // `TapGesture` (added simultaneously) expands the overlay.
@@ -102,16 +118,16 @@ struct DogfoodPaneOverlayView: View {
         )
     }
 
-    /// Clamp an offset (relative to the bottom-trailing anchor) so the pill stays
-    /// at least partially within the scene. The pill is the only affordance that
-    /// reopens the overlay, so a long drag must not strand it off-screen with no
-    /// hittable control left. Negative width moves left, negative height moves up.
+    /// Clamp an offset (relative to the top-leading anchor) so the pill stays
+    /// fully within the scene. The pill is the only affordance that reopens the
+    /// overlay, so a long drag must not strand it off-screen with no hittable
+    /// control left. Positive width moves right, positive height moves down.
     private func clampedOffset(_ offset: CGSize, in size: CGSize) -> CGSize {
-        let minWidth = -max(0, size.width - Self.pillSize - Self.pillEdgeMargin)
-        let minHeight = -max(0, size.height - Self.pillSize - Self.pillEdgeMargin)
+        let maxWidth = max(Self.pillEdgeMargin, size.width - Self.pillSize - Self.pillEdgeMargin)
+        let maxHeight = max(Self.pillEdgeMargin, size.height - Self.pillSize - Self.pillEdgeMargin)
         return CGSize(
-            width: min(-Self.pillEdgeMargin, max(minWidth, offset.width)),
-            height: min(-Self.pillEdgeMargin, max(minHeight, offset.height))
+            width: min(maxWidth, max(Self.pillEdgeMargin, offset.width)),
+            height: min(maxHeight, max(Self.pillEdgeMargin, offset.height))
         )
     }
 

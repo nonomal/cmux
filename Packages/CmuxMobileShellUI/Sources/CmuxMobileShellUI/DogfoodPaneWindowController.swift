@@ -22,6 +22,10 @@ final class DogfoodPaneWindowController {
     ///   - model: The pane model the overlay binds to.
     init(scene: UIWindowScene, model: DogfoodFeedbackModel) {
         let window = DogfoodPaneWindow(windowScene: scene)
+        // The window's `hitTest` reads the pane's published interactive frame from
+        // the model to decide pass-through vs. capture, so the model must be wired
+        // before any touch arrives.
+        window.model = model
         // One level above `.normal` so it floats over the app content but below
         // system alerts. It is a passthrough window, so it never blocks the app.
         window.windowLevel = .normal + 1

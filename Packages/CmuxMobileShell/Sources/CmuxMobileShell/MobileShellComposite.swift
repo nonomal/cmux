@@ -214,6 +214,13 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
                 b: terminalInputText.isEmpty ? 1 : 0
             ))
             #endif
+            // Persist the live edit under the CURRENT terminal so it survives a
+            // keyboard-dismiss/relaunch. Skipped while a draft is being loaded
+            // (the load is the persisted value, re-saving it is redundant and
+            // would race the per-terminal key swap) and when the value is
+            // unchanged.
+            guard !isLoadingDraft, terminalInputText != oldValue else { return }
+            persistCurrentDraft()
         }
     }
     /// Whether the iMessage-style composer is shown above the terminal. Toggled
@@ -242,7 +249,40 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
             syncSelectedTerminalForWorkspace()
         }
     }
-    public var selectedTerminalID: MobileTerminalPreview.ID?
+    public var selectedTerminalID: MobileTerminalPreview.ID? {
+        willSet {
+            // Capture the draft of the terminal we are leaving BEFORE the new id
+            // lands, so `swapDraft(from:to:)` can persist it under the correct
+            // (old) key. A no-op when the id is unchanged.
+            guard newValue != selectedTerminalID else { return }
+            draftedOutgoingTerminalID = selectedTerminalID
+            draftedOutgoingText = terminalInputText
+        }
+        didSet {
+            guard selectedTerminalID != oldValue else { return }
+            swapDraft(from: draftedOutgoingTerminalID, outgoingText: draftedOutgoingText, to: selectedTerminalID)
+            draftedOutgoingTerminalID = nil
+            draftedOutgoingText = ""
+        }
+    }
+
+    /// The per-terminal composer-draft persistence seam. `nil` in previews/tests
+    /// that do not exercise persistence; every draft hook is then a no-op and the
+    /// in-memory ``terminalInputText`` behaves exactly as before. Injected from
+    /// the app composition root.
+    private let draftStore: (any TerminalDraftStoring)?
+
+    /// True while a persisted draft is being loaded INTO ``terminalInputText``, so
+    /// its `didSet` does not immediately re-persist the just-loaded value (which
+    /// would also race the key swap). Not observed: it gates a write, not view
+    /// state.
+    @ObservationIgnored private var isLoadingDraft = false
+    /// The terminal id we are switching away from, captured in
+    /// ``selectedTerminalID``'s `willSet` so its draft is saved under the right key.
+    @ObservationIgnored private var draftedOutgoingTerminalID: MobileTerminalPreview.ID?
+    /// The draft text of the terminal we are switching away from, captured with
+    /// ``draftedOutgoingTerminalID``.
+    @ObservationIgnored private var draftedOutgoingText: String = ""
 
     /// Surface IDs whose next window attach must NOT grab the keyboard.
     ///
@@ -400,9 +440,11 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         deliveredNotificationClearer: any DeliveredNotificationClearing = SystemDeliveredNotificationClearer(),
         pairingHintDefaults: UserDefaults = .standard,
         analytics: any AnalyticsEmitting = NoopAnalytics(),
-        diagnosticLog: DiagnosticLog? = nil
+        diagnosticLog: DiagnosticLog? = nil,
+        draftStore: (any TerminalDraftStoring)? = nil
     ) {
         self.runtime = runtime
+        self.draftStore = draftStore
         self.pairedMacStore = pairedMacStore
         self.identityProvider = identityProvider
         self.reachability = reachability
@@ -504,7 +546,13 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         macConnectionStatus = .unavailable
         connectedHostName = ""
         pairingCode = ""
+        // Wipe every persisted draft so the next account never sees the previous
+        // user's unsent text. Guard the in-memory clear (and the selection resets
+        // below) so the per-terminal draft hooks do not write partial state into a
+        // store we are about to empty wholesale.
+        isLoadingDraft = true
         terminalInputText = ""
+        draftStore.map { store in Task { await store.clearAllDrafts() } }
         connectionError = nil
         activeTicket = nil
         activeRoute = nil
@@ -525,6 +573,9 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         workspaces = PreviewMobileHost.workspaces
         selectedWorkspaceID = workspaces.first?.id
         selectedTerminalID = workspaces.first?.terminals.first?.id
+        // Selection resets above are done; allow draft persistence again so a
+        // subsequent sign-in restores drafts normally.
+        isLoadingDraft = false
     }
 
     public func resumeForegroundRefresh() {
@@ -2509,6 +2560,73 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
             return
         }
         selectedTerminalID = selectedWorkspace.preferredTerminal?.id
+    }
+
+    // MARK: - Per-terminal composer drafts
+
+    /// Persist the live ``terminalInputText`` under the currently selected
+    /// terminal. Called from the field's `didSet`. A no-op when there is no
+    /// selected terminal (nothing to key the draft to) or no draft store wired.
+    private func persistCurrentDraft() {
+        guard let draftStore, let terminalID = selectedTerminalID?.rawValue else { return }
+        let text = terminalInputText
+        Task { await draftStore.saveDraft(text, forTerminalID: terminalID) }
+    }
+
+    /// Swap the composer draft when the selected terminal changes: persist the
+    /// outgoing terminal's text under its own key, then load the incoming
+    /// terminal's saved draft into ``terminalInputText``.
+    ///
+    /// The load is guarded by ``isLoadingDraft`` so the field's `didSet` does not
+    /// re-persist the just-loaded value (and so the load can't race the key swap).
+    /// While the incoming draft is fetched asynchronously the field is cleared, so
+    /// the previous terminal's text never bleeds into a terminal that has no draft.
+    /// - Parameters:
+    ///   - outgoingID: The terminal being switched away from, or `nil`.
+    ///   - outgoingText: That terminal's draft text at the moment of the switch.
+    ///   - incomingID: The terminal being switched to, or `nil`.
+    private func swapDraft(
+        from outgoingID: MobileTerminalPreview.ID?,
+        outgoingText: String,
+        to incomingID: MobileTerminalPreview.ID?
+    ) {
+        guard let draftStore else { return }
+        // Clear the field synchronously so the old terminal's text is not briefly
+        // shown under the new terminal while its draft loads. Guarded so this
+        // clear is not itself persisted.
+        if !terminalInputText.isEmpty {
+            isLoadingDraft = true
+            terminalInputText = ""
+            isLoadingDraft = false
+        }
+        Task { [weak self] in
+            if let outgoingID {
+                await draftStore.saveDraft(outgoingText, forTerminalID: outgoingID.rawValue)
+            }
+            guard let incomingID else { return }
+            let restored = await draftStore.draft(forTerminalID: incomingID.rawValue) ?? ""
+            await self?.applyLoadedDraft(restored, forTerminalID: incomingID)
+        }
+    }
+
+    /// Apply a draft fetched off the main actor back into ``terminalInputText``,
+    /// but only if the terminal it was loaded for is still selected (a fast
+    /// re-switch could otherwise drop a stale draft into the wrong terminal). The
+    /// write is guarded so it is not re-persisted.
+    private func applyLoadedDraft(_ draft: String, forTerminalID terminalID: MobileTerminalPreview.ID) {
+        guard selectedTerminalID == terminalID, terminalInputText != draft else { return }
+        isLoadingDraft = true
+        terminalInputText = draft
+        isLoadingDraft = false
+    }
+
+    /// Drop the persisted draft for the currently selected terminal (e.g. after
+    /// its composed text was successfully sent). The in-memory field is cleared by
+    /// the submit paths; this only removes the durable copy so it cannot resurrect
+    /// on relaunch.
+    private func clearCurrentPersistedDraft() {
+        guard let draftStore, let terminalID = selectedTerminalID?.rawValue else { return }
+        Task { await draftStore.clearDraft(forTerminalID: terminalID) }
     }
 
     private func viewportKey(

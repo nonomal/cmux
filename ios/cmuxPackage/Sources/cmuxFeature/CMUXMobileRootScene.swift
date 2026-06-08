@@ -36,6 +36,11 @@ public struct CMUXMobileRootScene: View {
     private let displaySettings: MobileDisplaySettings
     #endif
     private let pairedMacStore: (any MobilePairedMacStoring)?
+    /// Persists per-terminal composer drafts to the app container so an unsent
+    /// message survives keyboard dismiss, terminal switches, and app relaunch.
+    /// `nil` if the on-disk store could not be opened (drafts then stay
+    /// in-memory-only, as before).
+    private let draftStore: (any TerminalDraftStoring)?
     #if DEBUG
     /// The structured diagnostic log injected into the shell store so the DEV
     /// dogfood feedback round-trip can export it. DEBUG-only; `nil` when the app
@@ -73,6 +78,7 @@ public struct CMUXMobileRootScene: View {
         self.pushCoordinator = pushCoordinator
         self.displaySettings = displaySettings
         self.pairedMacStore = Self.openPairedMacStore()
+        self.draftStore = Self.openDraftStore()
         #if DEBUG
         self.diagnosticLog = diagnosticLog
         #endif
@@ -90,6 +96,7 @@ public struct CMUXMobileRootScene: View {
         self.reachability = reachability
         self.analytics = analytics
         self.pairedMacStore = Self.openPairedMacStore()
+        self.draftStore = Self.openDraftStore()
         #if DEBUG
         self.diagnosticLog = nil
         #endif
@@ -102,6 +109,17 @@ public struct CMUXMobileRootScene: View {
         } catch {
             mobileRootSceneLog.error(
                 "failed to open paired mac store: \(String(describing: error), privacy: .public)"
+            )
+            return nil
+        }
+    }
+
+    private static func openDraftStore() -> (any TerminalDraftStoring)? {
+        do {
+            return try TerminalDraftStore()
+        } catch {
+            mobileRootSceneLog.error(
+                "failed to open terminal draft store: \(String(describing: error), privacy: .public)"
             )
             return nil
         }
@@ -140,7 +158,8 @@ public struct CMUXMobileRootScene: View {
             identityProvider: identityProvider,
             reachability: reachability,
             analytics: analytics,
-            diagnosticLog: diagnosticLog
+            diagnosticLog: diagnosticLog,
+            draftStore: draftStore
         )
         #else
         return CMUXMobileShellStore(
@@ -148,7 +167,8 @@ public struct CMUXMobileRootScene: View {
             pairedMacStore: pairedMacStore,
             identityProvider: identityProvider,
             reachability: reachability,
-            analytics: analytics
+            analytics: analytics,
+            draftStore: draftStore
         )
         #endif
     }

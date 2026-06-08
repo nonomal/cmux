@@ -1,5 +1,6 @@
 #if DEBUG
 public import CmuxMobileShellModel
+public import CoreGraphics
 public import Foundation
 import Observation
 
@@ -39,6 +40,20 @@ public final class DogfoodFeedbackModel {
     /// Whether the pane is expanded into the full overlay (vs. collapsed to the
     /// draggable bug pill).
     public var isExpanded: Bool = false
+
+    /// The pane's interactive hit region in the overlay window's coordinate
+    /// space: the bug pill's frame when collapsed, the expanded card's frame when
+    /// expanded. `.zero` until the overlay reports a geometry.
+    ///
+    /// The pane lives in a passthrough `UIWindow`; SwiftUI hosts the pill's tap +
+    /// drag gestures on the single hosting view, so the window cannot tell "touch
+    /// on the pill" from "touch on empty space" by walking the view tree (both
+    /// resolve to the hosting view). The overlay therefore publishes the visible
+    /// control's frame here, and ``DogfoodPaneWindow`` passes a touch through to
+    /// the app only when it lands OUTSIDE this rect. A positive hit-region test is
+    /// the only correct discriminator: a "is this the root view" comparison either
+    /// eats every terminal touch or kills the pill's own gestures.
+    public var interactiveFrame: CGRect = .zero
 
     /// True while a "Capture & Send" submit is in flight (disables the button).
     public private(set) var isSubmitting: Bool = false
