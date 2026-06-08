@@ -21,7 +21,6 @@ struct WorkspaceDetailView: View {
     let reportTerminalViewport: (MobileWorkspacePreview.ID, MobileTerminalPreview.ID, MobileTerminalViewportSize) -> Void
     let sendTerminalInput: (String) -> Void
     let safeAreaContext: MobileTerminalSafeAreaContext
-    @State private var isTerminalPickerPresented = false
     #if os(iOS)
     /// Cross-layer handle: the surface publishes its docked toolbar here while the
     /// composer is open so the composer can host it below its field (round 5 order:
@@ -98,9 +97,28 @@ struct WorkspaceDetailView: View {
                 .padding(.leading, 10)
         }
         #if os(iOS)
+        // Round 6: the compose field and the docked accessory toolbar are TWO stacked
+        // bottom insets, not one VStack inside one inset (round 5). SwiftUI applies the
+        // toolbar inset SECOND so it lands OUTERMOST — directly on the keyboard top —
+        // and applies the field inset FIRST so it lands INNER, just above the toolbar.
+        // A field-grow changes only the (inner) field inset's height, pushing the
+        // terminal up; the constant-height toolbar inset is structurally pinned to the
+        // keyboard top and cannot drift. This is the deterministic re-approach to the
+        // twice-failed "toolbar moves when the composer grows" bug: the toolbar's slot
+        // is decoupled from the field's height by construction.
         .safeAreaInset(edge: .bottom, spacing: 0) {
             if store.isComposerPresented {
-                TerminalComposerView(store: store, toolbarHandoff: toolbarHandoff)
+                TerminalComposerView(store: store)
+            }
+        }
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if store.isComposerPresented, let toolbar = toolbarHandoff.toolbarView {
+                // Full-bleed, constant-height toolbar pinned at the keyboard top. The
+                // host frames it to the same band the in-surface dock reserves
+                // (`dockedToolbarHeight`), so the surface path and this composer path
+                // agree on the toolbar's size.
+                ComposerDockedToolbarHost(toolbarView: toolbar)
+                    .frame(height: GhosttySurfaceView.dockedToolbarHeight)
             }
         }
         .mobileTerminalSafeAreaExpansion(
@@ -150,10 +168,19 @@ struct WorkspaceDetailView: View {
         .accessibilityIdentifier("MobileTerminalNewWorkspaceButton")
     }
 
+    // The picker is a native SwiftUI `Menu`, which renders as the platform menu
+    // (a `UIMenu` on iOS). That gives the standard menu gesture for free: a
+    // single tap opens it, and a press-and-drag from the button onto an item
+    // followed by a release selects that item. The previous `Button` +
+    // `.popover` was two separate hit-test sessions (tap to present, then tap an
+    // item), so it never supported press-drag-release. Selection still routes
+    // through `selectTerminalFromPicker`, which dismisses the keyboard, so the
+    // chrome behavior is preserved; only keyboard-dismiss-on-open is dropped
+    // because `Menu` has no will-open hook (the menu simply floats over the live
+    // keyboard like any nav-bar menu).
     private var terminalPickerToolbarButton: some View {
-        Button {
-            dismissTerminalKeyboardForChrome()
-            isTerminalPickerPresented = true
+        Menu {
+            terminalPickerMenuContent
         } label: {
             Label(
                 selectedTerminal?.name ?? L10n.string("mobile.terminal.select", defaultValue: "Terminal"),
@@ -164,19 +191,11 @@ struct WorkspaceDetailView: View {
         .foregroundStyle(TerminalPalette.foreground)
         .accessibilityIdentifier("MobileTerminalDropdown")
         .accessibilityValue(host)
-        .popover(isPresented: $isTerminalPickerPresented, arrowEdge: .top) {
-            terminalPickerContent
-        }
     }
 
-    private var terminalPickerContent: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(L10n.string("mobile.terminal.picker.title", defaultValue: "Terminals"))
-                .font(.headline)
-                .padding(.horizontal, 16)
-                .padding(.top, 14)
-                .padding(.bottom, 8)
-
+    @ViewBuilder
+    private var terminalPickerMenuContent: some View {
+        Section(L10n.string("mobile.terminal.picker.title", defaultValue: "Terminals")) {
             ForEach(workspace.terminals) { terminal in
                 Button {
                     selectTerminalFromPicker(terminal.id)
@@ -185,69 +204,42 @@ struct WorkspaceDetailView: View {
                         terminal.name,
                         systemImage: terminal.id == selectedTerminal?.id ? "checkmark.circle.fill" : "terminal"
                     )
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 10)
                 .accessibilityIdentifier("MobileTerminalMenuItem-\(terminal.id.rawValue)")
             }
+        }
 
-            Divider()
-                .padding(.vertical, 4)
-
-            Button(action: createWorkspaceFromTerminalPicker) {
+        Section {
+            Button(action: createWorkspaceFromToolbar) {
                 Label(L10n.string("mobile.workspace.new", defaultValue: "New Workspace"), systemImage: "plus.square.on.square")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
             .accessibilityIdentifier("MobileNewWorkspaceMenuItem")
 
             Button(action: createTerminalFromToolbar) {
                 Label(L10n.string("mobile.terminal.new", defaultValue: "New Terminal"), systemImage: "plus")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
             .accessibilityIdentifier("MobileNewTerminalMenuItem")
+        }
 
-            #if DEBUG && canImport(UIKit)
+        #if DEBUG && canImport(UIKit)
+        Section {
             Button(action: copyDebugLogsFromMenu) {
                 // DEV-only debug tooling; not shipped, so not localized.
                 Label("Copy Debug Logs", systemImage: "doc.on.clipboard")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
             .accessibilityIdentifier("MobileCopyDebugLogsMenuItem")
 
             Button(action: openFeedbackComposerFromMenu) {
                 // DEV-only debug tooling; not shipped, so not localized.
                 Label("Send to agent", systemImage: "paperplane")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 16)
-            .padding(.vertical, 10)
             .accessibilityIdentifier("MobileSendFeedbackMenuItem")
-            #endif
         }
-        .frame(minWidth: 240, maxWidth: 320, alignment: .leading)
-        .presentationCompactAdaptation(.popover)
+        #endif
     }
 
     #if DEBUG && canImport(UIKit)
     private func copyDebugLogsFromMenu() {
-        isTerminalPickerPresented = false
         // Include "what the user sees" (the visible terminal text) above the
         // debug log so a pasted bug report shows the on-screen content too.
         let terminalText = GhosttySurfaceView.visibleTerminalSnapshot()
@@ -259,7 +251,6 @@ struct WorkspaceDetailView: View {
     }
 
     private func openFeedbackComposerFromMenu() {
-        isTerminalPickerPresented = false
         feedbackText = ""
         isFeedbackComposerPresented = true
     }
@@ -326,21 +317,13 @@ struct WorkspaceDetailView: View {
         createWorkspace()
     }
 
-    private func createWorkspaceFromTerminalPicker() {
-        dismissTerminalKeyboardForChrome()
-        isTerminalPickerPresented = false
-        createWorkspace()
-    }
-
     private func createTerminalFromToolbar() {
         dismissTerminalKeyboardForChrome()
-        isTerminalPickerPresented = false
         createTerminal()
     }
 
     private func selectTerminalFromPicker(_ terminalID: MobileTerminalPreview.ID) {
         dismissTerminalKeyboardForChrome()
-        isTerminalPickerPresented = false
         // Switching from the picker is chrome, not a typing intent, so the
         // newly-selected surface must not grab the keyboard on attach. The
         // store suppresses the target's autofocus (and is a no-op when it is

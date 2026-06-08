@@ -964,9 +964,19 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
                 // outright so the two states can never desync. The host dismisses the
                 // composer, which collapses it and tears down its field consistently.
                 #if DEBUG
+                // Mirror the data code 23 captures so a single Capture&Send trace is
+                // conclusive about the dismiss-tap that can strand the composer with
+                // the keyboard down: `a` = proxy-was-FR, `b` = the resolved FR owner
+                // identity at the tap (which view actually held FR), `ms` = the
+                // surface's keyboardHeight at the tap. Without `b`/`ms`, code 24 only
+                // knew the proxy's own FR state, not who owned FR or whether the
+                // keyboard was already collapsing.
+                let frOwner = TerminalInputTextView.responderIdentity(of: CurrentResponderProbe.current())
                 self.diagnosticLog?.record(DiagnosticEvent(
                     .composerKeyboardToggleWhilePresented,
-                    a: self.inputProxy.isFirstResponder ? 1 : 0
+                    ms: UInt32(max(0, self.keyboardHeight)),
+                    a: self.inputProxy.isFirstResponder ? 1 : 0,
+                    b: frOwner.rawValue
                 ))
                 #endif
                 self.delegate?.ghosttySurfaceViewDidRequestComposerDismiss(self)
@@ -1252,6 +1262,22 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
 
     @objc private func handleKeyboardWillHide(_ notification: Notification) {
         guard keyboardHeight != 0 else { return }
+        #if DEBUG
+        // The composer-up/keyboard-down desync can be reached WITHOUT the dismiss
+        // button (code 24): a swipe-to-dismiss, an attached hardware keyboard, or
+        // backgrounding all collapse the keyboard straight through this overlap→0
+        // transition. Codes 23/24 are silent on those paths, so the onset of the
+        // desync — `keyboardHeight→0 while the composer is still active` — is recorded
+        // here too, with the resolved first-responder owner, so a Capture&Send trace
+        // is complete no matter how the keyboard went down. Pure diagnostics; the hide
+        // behavior below is unchanged.
+        if composerActive {
+            let frOwner = TerminalInputTextView.responderIdentity(of: CurrentResponderProbe.current())
+            MobileDebugLog.anchormux(
+                "composer.keyboardHideWhilePresented prevKeyboardHeight=\(Int(keyboardHeight)) frOwner=\(frOwner.rawValue) proxyIsFR=\(inputProxy.isFirstResponder ? 1 : 0)"
+            )
+        }
+        #endif
         keyboardHeight = 0
         inputProxy.setKeyboardShown(false)
         // Keyboard going down hides the docked bar and releases its reserved grid
@@ -1473,19 +1499,25 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
     /// overlays its lower edge (like a system tab bar) instead of leaving an
     /// empty strip below it.
     ///
-    /// The bar's TOP is anchored to the rendered terminal's bottom edge
-    /// (`lastRenderRect.maxY`), not the reserved grid bottom. libghostty floors
-    /// the grid to whole cells and top-anchors the render, so the reserved
-    /// container is up to ~one cell taller than the rendered content; pinning the
-    /// bar to the reserved bottom (`bounds.height - 44 - keyboard`) left that
-    /// sub-cell remainder as a visible terminal-background gap between the last
-    /// row and the toolbar. Anchoring to `lastRenderRect.maxY` instead makes the
-    /// buttons sit flush under the last terminal row, and the bar grows DOWNWARD
-    /// to the keyboard edge so the sub-cell slack is absorbed *below* the buttons
-    /// (covered by the bar's own background) rather than shown above them. The
-    /// buttons themselves are top-aligned in the bar (see the accessory toolbar's
-    /// stack constraints) so they hug that top edge. Falls back to the reserved
-    /// bottom before the first geometry pass measures `lastRenderRect`.
+    /// The bar's BOTTOM is anchored to the keyboard top (`bounds.height -
+    /// keyboardOccupancyInBounds`) and its TOP to the rendered terminal's bottom
+    /// edge (`lastRenderRect.maxY`). libghostty floors the grid to whole cells and
+    /// top-anchors the render, so the reserved container is up to ~one cell taller
+    /// than the rendered content. The container therefore spans that whole band, and
+    /// its background fills the sub-cell remainder so no terminal-background gap shows
+    /// between the last row and the bar.
+    ///
+    /// Round 6: the button row inside this container is pinned to the container's
+    /// BOTTOM (see `TerminalInputTextView.dockedButtonRowHeight` / the docked bar's
+    /// constraints), so the controls always hug the keyboard top (`bottomEdge`)
+    /// regardless of how tall the container grows. Round 5 top-pinned the controls,
+    /// which let them ride UP off the keyboard whenever a letterbox/resize pushed
+    /// `lastRenderRect.maxY` above `reservedTop` (the "toolbar doesn't stick to
+    /// keyboard top on resize" bug) — the bottom edge of the bar was correct, but the
+    /// visible buttons were not. Now the keyboard top is the single deterministic
+    /// anchor for the controls; the only thing that floats with the render bottom is
+    /// the bar's top edge (pure background). Falls back to the reserved bottom before
+    /// the first geometry pass measures `lastRenderRect`.
     private func dockedToolbarFrame() -> CGRect {
         let occupied = keyboardOccupancyInBounds
         let bottomEdge = bounds.height - occupied
@@ -1493,13 +1525,13 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         // bottom sits at or above this line; it is the fallback top before
         // geometry measures `lastRenderRect`.
         let reservedTop = bottomEdge - Self.persistentToolbarHeight
-        // Anchor the bar's top to the rendered terminal's bottom edge when
-        // measured. Because libghostty floors the grid to whole cells and
-        // top-anchors it, `lastRenderRect.maxY` is at or ABOVE `reservedTop` by the
-        // sub-cell remainder, so the bar moves UP to hug the last row and grows
-        // taller toward the keyboard edge (the slack is absorbed below the button
-        // row, which is top-pinned inside the bar). Never let the top drop below
-        // `reservedTop` (that would re-open the gap) and never go negative.
+        // Anchor the bar's top to the rendered terminal's bottom edge when measured.
+        // Because libghostty floors the grid to whole cells and top-anchors it,
+        // `lastRenderRect.maxY` is at or ABOVE `reservedTop` by the sub-cell remainder,
+        // so the container grows UPWARD to hug the last row; the bottom-pinned button
+        // row stays at the keyboard top and the slack is absorbed ABOVE it (covered by
+        // the bar's own background). Never let the top drop below `reservedTop` (that
+        // would re-open the gap) and never go negative.
         let renderBottom = lastRenderRect.isEmpty ? reservedTop : lastRenderRect.maxY
         let top = max(0, min(renderBottom, reservedTop))
         return CGRect(x: 0, y: top, width: bounds.width, height: bottomEdge - top)

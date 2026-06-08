@@ -22,8 +22,10 @@ struct DogfoodPaneOverlayView: View {
     /// The pill's free-drag offset from its default top-leading anchor.
     @State private var dragOffset: CGSize = .zero
     /// Default resting position: top-left of the screen, just inside the safe
-    /// area. Positive width moves right, positive height moves down.
-    @State private var accumulatedOffset: CGSize = CGSize(width: 16, height: 64)
+    /// area. Positive width moves right, positive height moves down. Round 6 spawns
+    /// it ~30px lower (64 → 94) so it clears the connection-status pill / nav chrome
+    /// at the top-left on first launch.
+    @State private var accumulatedOffset: CGSize = CGSize(width: 16, height: 94)
     /// True while the reposition ``DragGesture`` is active; drives the pill's
     /// lifted scale/stroke. The `TapGesture` and `DragGesture` are independent, so
     /// this no longer gates tap-to-expand — it is purely a visual cue.

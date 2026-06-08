@@ -14,16 +14,18 @@ import SwiftUI
 /// interior newline. Toggled from the input accessory bar's composer button; the
 /// chevron dismisses it.
 ///
-/// Round 5 hosts the terminal's docked accessory toolbar (modifier / arrow / Ctrl
-/// row) BELOW the compose field: the stack reads terminal / composer field /
-/// toolbar / keyboard, so the toolbar rides the keyboard edge and stays put while
-/// the field grows upward and pushes only the terminal. The toolbar is the same
-/// single surface view, borrowed via ``ComposerToolbarHandoff``.
+/// Round 6 stacks the compose field and the terminal's docked accessory toolbar
+/// (modifier / arrow / Ctrl row) as TWO separate bottom `safeAreaInset`s in
+/// ``WorkspaceDetailView`` (field inset applied first / inner, toolbar inset applied
+/// second / outer, pinned at keyboard top). This view is the field inset only; the
+/// toolbar host (``ComposerDockedToolbarHost``) is a sibling inset. Splitting them
+/// means a field-grow changes only the field inset's height (pushing the terminal up)
+/// and structurally cannot move the constant-height toolbar inset off the keyboard
+/// top — round 5 put both in one VStack inside one inset, where the whole stack
+/// reflowed as a unit on every keystroke and the toolbar drifted. The toolbar is
+/// still the same single surface view, borrowed via ``ComposerToolbarHandoff``.
 struct TerminalComposerView: View {
     @Bindable var store: CMUXMobileShellStore
-    /// The borrowed docked toolbar, published by the surface representable while the
-    /// composer is open. `nil` for a frame between open and the surface publishing.
-    @Bindable var toolbarHandoff: ComposerToolbarHandoff
     @FocusState private var isFieldFocused: Bool
 
     /// Single-line height of the round close/send buttons. They stay pinned to the
@@ -48,16 +50,11 @@ struct TerminalComposerView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            composerSurface
-            // The docked toolbar rides the bottom edge below the field (round 5
-            // order). It is full-bleed, so it breaks the composer's horizontal
-            // padding and sits flush to the screen edges like the in-surface dock.
-            if let toolbar = toolbarHandoff.toolbarView {
-                ComposerDockedToolbarHost(toolbarView: toolbar)
-                    .frame(height: GhosttySurfaceView.dockedToolbarHeight)
-            }
-        }
+        // Field only (round 6). The docked toolbar is a SEPARATE outer bottom inset
+        // in ``WorkspaceDetailView`` so a field-grow cannot move it (see this view's
+        // doc comment). Growing this field grows this inset, which pushes the terminal
+        // up; the toolbar inset below stays pinned to the keyboard top.
+        composerSurface
         .onAppear {
             recordComposerEvent(.composerViewAppear)
             focusField()
