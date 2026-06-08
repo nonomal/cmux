@@ -2609,12 +2609,19 @@ public final class MobileShellComposite: MobileTerminalOutputSinking {
         }
     }
 
-    /// Apply a draft fetched off the main actor back into ``terminalInputText``,
-    /// but only if the terminal it was loaded for is still selected (a fast
-    /// re-switch could otherwise drop a stale draft into the wrong terminal). The
-    /// write is guarded so it is not re-persisted.
+    /// Apply a draft fetched off the main actor back into ``terminalInputText``.
+    ///
+    /// Applied only if the terminal it was loaded for is still selected (a fast
+    /// re-switch could otherwise drop a stale draft into the wrong terminal) AND the
+    /// field is still empty — i.e. the user has not started typing into the
+    /// freshly-cleared field during the (tiny) async load window. A non-empty field
+    /// means the user is already composing for this terminal, and that live input
+    /// (persisted on its own) must win over the disk copy. The restore write is
+    /// guarded so it is not re-persisted. An empty restored draft is a no-op.
     private func applyLoadedDraft(_ draft: String, forTerminalID terminalID: MobileTerminalPreview.ID) {
-        guard selectedTerminalID == terminalID, terminalInputText != draft else { return }
+        guard selectedTerminalID == terminalID,
+              terminalInputText.isEmpty,
+              !draft.isEmpty else { return }
         isLoadingDraft = true
         terminalInputText = draft
         isLoadingDraft = false
