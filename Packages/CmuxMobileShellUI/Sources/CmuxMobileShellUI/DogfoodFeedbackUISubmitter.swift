@@ -49,22 +49,22 @@ final class DogfoodFeedbackUISubmitter: DogfoodFeedbackSubmitting {
     /// Render a PNG of the app's content window (chrome only; the terminal is a
     /// Metal layer and renders blank, which is why the terminal text rides along).
     ///
-    /// Uses `drawHierarchy(in:afterScreenUpdates:)` on the app's key window,
-    /// explicitly skipping the dogfood overlay window (so the pill/pane do not
-    /// appear in the shot). `ImageRenderer` would render a SwiftUI view we hand
-    /// it, not the live UIKit hierarchy, so it is the wrong tool here. Returns
-    /// `nil` if no suitable app window is found or the render fails.
+    /// Uses `drawHierarchy(in:afterScreenUpdates:)` on the app's key window.
+    /// `ImageRenderer` would render a SwiftUI view we hand it, not the live UIKit
+    /// hierarchy, so it is the wrong tool here. Returns `nil` if no suitable app
+    /// window is found or the render fails.
+    ///
+    /// The dogfood pane is now an in-hierarchy `.overlay` (not a separate
+    /// window), so the small bug pill rides along in the corner of the shot. That
+    /// is an accepted DEV-only cosmetic; the alternative was the hand-rolled
+    /// passthrough window whose `hitTest` killed the pill's tap + drag.
     private static func captureChromeScreenshotPNG() -> Data? {
         guard let scene = UIApplication.shared.connectedScenes
             .compactMap({ $0 as? UIWindowScene })
             .first(where: { $0.activationState == .foregroundActive })
             ?? UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }).first
         else { return nil }
-        // The app's content window is the first non-overlay window in the scene.
-        // The dogfood overlay is a `DogfoodPaneWindow`, excluded here so the shot
-        // is the app, not the pane.
-        let appWindows = scene.windows.filter { !($0 is DogfoodPaneWindow) }
-        guard let window = appWindows.first(where: { $0.isKeyWindow }) ?? appWindows.first else {
+        guard let window = scene.windows.first(where: { $0.isKeyWindow }) ?? scene.windows.first else {
             return nil
         }
         let bounds = window.bounds

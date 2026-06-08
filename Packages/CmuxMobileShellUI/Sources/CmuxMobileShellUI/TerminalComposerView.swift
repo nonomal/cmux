@@ -16,10 +16,21 @@ struct TerminalComposerView: View {
     @Bindable var store: CMUXMobileShellStore
     @FocusState private var isFieldFocused: Bool
 
-    /// Single-line height shared by the field pill and the round buttons so they
-    /// line up. The field grows taller for multi-line input; the buttons stay
-    /// pinned to the bottom edge.
+    /// Single-line height of the round close/send buttons. They stay pinned to the
+    /// bottom edge of the (taller) field via the `HStack`'s `.bottom` alignment.
     private let controlHeight: CGFloat = 40
+
+    /// Line range for the growing compose field. Draft mode is the taller surface,
+    /// so it opens at a 3-line minimum (instead of one) and grows up to 14 lines
+    /// before scrolling, giving a long message real room while the docked toolbar
+    /// stays visible above the keyboard.
+    private let composerLineLimit = 3...14
+
+    /// Minimum height of the compose field, sized so the field is visibly taller
+    /// than the round buttons from the moment the composer opens (≈ three lines of
+    /// the callout font plus its vertical padding). It still grows with content up
+    /// to ``composerLineLimit``.
+    private let composerFieldMinHeight: CGFloat = 96
 
     private var trimmedIsEmpty: Bool {
         store.terminalInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -90,14 +101,18 @@ struct TerminalComposerView: View {
                 text: $store.terminalInputText,
                 axis: .vertical
             )
-            .lineLimit(1...8)
+            // Draft mode keeps the docked toolbar visible (the bar no longer hides
+            // when the composer opens), and the composer is the taller surface: it
+            // starts at a comfortable multi-line height and grows up to 14 lines so
+            // a long message has room instead of the bar disappearing to make space.
+            .lineLimit(composerLineLimit)
             .textInputAutocapitalization(.never)
             .autocorrectionDisabled(true)
             .focused($isFieldFocused)
             .foregroundStyle(TerminalPalette.foreground)
             .padding(.horizontal, 14)
             .padding(.vertical, 9)
-            .frame(minHeight: controlHeight)
+            .frame(minHeight: composerFieldMinHeight, alignment: .top)
             .mobileGlassField(cornerRadius: 20)
             .accessibilityIdentifier("MobileComposerField")
 

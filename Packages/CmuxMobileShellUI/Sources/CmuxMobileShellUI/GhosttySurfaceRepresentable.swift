@@ -21,9 +21,10 @@ struct GhosttySurfaceRepresentable: UIViewRepresentable {
     /// actions (create workspace/terminal, switch terminal) do not pop the
     /// software keyboard.
     var autoFocusOnWindowAttach: Bool = true
-    /// Whether the SwiftUI composer is open. When true the surface hides its
-    /// docked accessory bar and releases its reserved grid height so the composer
-    /// can own the bottom edge and the keyboard.
+    /// Whether the SwiftUI composer is open. Forwarded to
+    /// `GhosttySurfaceView.setComposerActive`, which keeps the docked accessory bar
+    /// visible above the composer and pulls first responder back to the terminal
+    /// input when the composer closes so the keyboard stays up across the toggle.
     var isComposerActive: Bool = false
 
     func makeCoordinator() -> Coordinator {

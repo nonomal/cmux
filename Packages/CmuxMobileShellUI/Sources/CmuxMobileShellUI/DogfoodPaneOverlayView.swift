@@ -7,10 +7,13 @@ import SwiftUI
 /// multiple-choice question), a shared freeform note, and a Capture & Send
 /// button.
 ///
-/// Hosted in its own passthrough `UIWindow` (see ``DogfoodPaneWindowController``)
-/// so it floats over the terminal regardless of the SwiftUI view tree. The whole
-/// view is the only hittable content in that window; the rest is transparent and
-/// passes touches through to the app.
+/// Hosted as a normal in-hierarchy SwiftUI `.overlay` on the app's root content
+/// (see ``CMUXMobileAppView``), so SwiftUI's native hit-testing delivers the
+/// pill's tap + drag with no custom window. Only the pill (collapsed) or card
+/// (expanded) is hittable; the surrounding `Color.clear` backdrop disables hit
+/// testing so every other touch falls through to the app beneath. This replaces
+/// the old passthrough `UIWindow` whose hand-rolled `hitTest` kept returning
+/// `nil` on the pill's own touches and killing both gestures.
 ///
 /// DEV-only; not shipped, so its strings are not localized.
 struct DogfoodPaneOverlayView: View {
@@ -29,8 +32,10 @@ struct DogfoodPaneOverlayView: View {
     var body: some View {
         GeometryReader { proxy in
             ZStack(alignment: .topLeading) {
-                // Transparent backdrop: hit-tests off so taps fall through to the
-                // app window beneath this overlay window.
+                // Transparent backdrop: hit-testing off so every touch outside the
+                // pill/card falls through to the app beneath this overlay. This is
+                // what keeps the terminal usable while the pane floats above it; no
+                // custom window `hitTest` is involved any more.
                 Color.clear
                     .allowsHitTesting(false)
 
@@ -39,23 +44,9 @@ struct DogfoodPaneOverlayView: View {
                         .frame(maxWidth: min(360, proxy.size.width - 24))
                         .padding(12)
                         .transition(.scale(scale: 0.92).combined(with: .opacity))
-                        // Publish the card's window-space frame so the passthrough
-                        // window makes the whole card hittable while expanded.
-                        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { rect in
-                            model.interactiveFrame = rect
-                        }
                 } else {
                     pill
                         .offset(currentOffset(in: proxy.size))
-                        // Publish the pill's window-space frame so the passthrough
-                        // window's `hitTest` can return real hits for exactly this
-                        // region (and pass everything else through to the app). This
-                        // is what makes BOTH the tap and the drag work: without a
-                        // positive region the window either swallowed every touch or
-                        // rejected the pill's own gestures.
-                        .onGeometryChange(for: CGRect.self) { $0.frame(in: .global) } action: { rect in
-                            model.interactiveFrame = rect
-                        }
                         // Two cooperating recognizers: a `DragGesture` with a real
                         // movement threshold repositions the pill, and a
                         // `TapGesture` (added simultaneously) expands the overlay.

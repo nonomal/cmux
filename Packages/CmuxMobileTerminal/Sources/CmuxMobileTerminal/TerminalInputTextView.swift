@@ -232,15 +232,21 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
     private static let accessoryButtonContentInsets = NSDirectionalEdgeInsets(top: 5, leading: 8, bottom: 5, trailing: 8)
     private static let accessoryButtonCornerRadius: CGFloat = 6
     private static let accessoryButtonHeight: CGFloat = 28
+    /// Size of the directional arrow nub (the tallest control in the bar). The
+    /// button-row strip is sized to exactly this so the nub fills the strip with no
+    /// slack above it, and the host reserves exactly this much grid height. Round 4
+    /// dropped it from 34 to 32 to shave a couple more points off the bar around the
+    /// d-pad while keeping it a comfortable tap target.
+    static let dockedNubSize: CGFloat = 32
     /// Fixed height of the docked bar's button row, pinned to the container's top.
-    /// Sized to exactly the tallest control (the 34pt arrow nub), NOT the full 44pt
-    /// the grid reserves. The controls center on this tight strip, so they sit flush
-    /// near the bar's top (a few points below the terminal's last row) on one shared
-    /// centerline, and the remaining bar height the host adds (reserved-vs-strip
-    /// difference plus any sub-cell render slack) falls BELOW them, reading as the
-    /// bar's own background rather than a gap above the toolbar. Round 2 left ~8pt of
-    /// bar above the buttons because they centered in the full-height strip.
-    static let dockedButtonRowHeight: CGFloat = 34
+    /// Sized to exactly the tallest control (the arrow nub, ``dockedNubSize``), NOT
+    /// the full height the grid used to reserve. The controls center on this tight
+    /// strip, so they sit flush near the bar's top (only the ~2pt the 28pt buttons
+    /// center inside the strip) on one shared centerline. The host now reserves
+    /// EXACTLY this height (see `GhosttySurfaceView.persistentToolbarHeight`), so
+    /// there is no reserved-vs-strip background below the buttons either; only the
+    /// sub-cell render remainder, which the bar absorbs below the top-pinned row.
+    static let dockedButtonRowHeight: CGFloat = dockedNubSize
     /// Minimum (not fixed) button width. Text buttons (Tab, Esc, ^C, ^D) size to
     /// their intrinsic content width and only floor here so they hug their label
     /// plus the comfortable inset; single-glyph modifiers/icons take a fixed width
@@ -257,7 +263,10 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
     private lazy var terminalAccessoryToolbar: UIView = {
         let container = UIView()
         container.backgroundColor = .clear
-        container.frame = CGRect(x: 0, y: 0, width: 0, height: 44)
+        // Placeholder height until the host positions the bar via
+        // `dockedToolbarFrame()`; sized to the button-row strip so the pre-layout
+        // frame matches the reserved grid height.
+        container.frame = CGRect(x: 0, y: 0, width: 0, height: Self.dockedButtonRowHeight)
 
         let backgroundView = UIView()
         backgroundView.backgroundColor = Self.monokaiBarColor
@@ -350,8 +359,8 @@ final class TerminalInputTextView: UIView, UIKeyInput, UITextInput {
 
             nub.leadingAnchor.constraint(equalTo: dismissButton.trailingAnchor, constant: 6),
             nub.centerYAnchor.constraint(equalTo: buttonRow.centerYAnchor),
-            nub.widthAnchor.constraint(equalToConstant: 34),
-            nub.heightAnchor.constraint(equalToConstant: 34),
+            nub.widthAnchor.constraint(equalToConstant: Self.dockedNubSize),
+            nub.heightAnchor.constraint(equalToConstant: Self.dockedNubSize),
 
             scrollView.leadingAnchor.constraint(equalTo: nub.trailingAnchor, constant: 6),
             scrollTrailingConstraint,

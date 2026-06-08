@@ -27,10 +27,18 @@ public struct CMUXMobileAppView: View {
     public var body: some View {
         CMUXMobileRootView(store: store)
             #if os(iOS) && DEBUG
-            // Install the passthrough overlay window that floats the dogfood pane
-            // above the terminal. The 0-size installer resolves the window scene
-            // once it connects and retains the overlay window.
-            .background(DogfoodPaneInstaller(model: dogfoodFeedbackModel))
+            // Host the floating dogfood pane as a normal in-hierarchy overlay so
+            // SwiftUI's native hit-testing delivers BOTH the pill's tap and drag.
+            // The previous passthrough `UIWindow` owned its own `hitTest`, which
+            // repeatedly returned `nil` on the pill's own touches and killed the
+            // gestures. An `.overlay` whose only hittable content is the pill/card
+            // (everything else is `Color.clear` with hit-testing off) lets the app
+            // beneath receive every other touch with no custom window. It sits
+            // below SwiftUI `.sheet`s (the pairing + feedback sheets), which is an
+            // acceptable trade for a DEV pane.
+            .overlay {
+                DogfoodPaneOverlayView(model: dogfoodFeedbackModel)
+            }
             #endif
     }
 }

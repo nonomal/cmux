@@ -1160,9 +1160,15 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
     /// installed (`installPersistentToolbar`), so the home-indicator reservation
     /// still lands even if the toolbar UI is absent.
     private var reservedToolbarHeight: CGFloat = 0
-    /// Height of the docked accessory bar (the button row). Reserved in the grid
-    /// geometry so the bottom TUI rows stay visible above it.
-    private static let persistentToolbarHeight: CGFloat = 44
+    /// Height of the docked accessory bar reserved in the grid geometry so the
+    /// bottom TUI rows stay visible above it. Locked to the bar's actual button-row
+    /// height (`TerminalInputTextView.dockedButtonRowHeight`) so the grid reserves
+    /// EXACTLY the strip the buttons occupy — no taller. Round 3 reserved 44 while
+    /// the strip was only 34, so the extra 10pt rendered as bar background below
+    /// the buttons (the "gap below" Lawrence kept seeing). Matching them removes it,
+    /// leaving only the sub-cell render remainder, which the bar absorbs below the
+    /// top-pinned button row.
+    private static let persistentToolbarHeight: CGFloat = TerminalInputTextView.dockedButtonRowHeight
     /// The docked accessory bar. Positioned by `dockedToolbarFrame()` with the
     /// SAME bottom-occupancy math as the grid reservation, so its top is always
     /// flush with the grid bottom (no gap) and its bottom rests on the keyboard
@@ -1270,12 +1276,17 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         layoutDockedToolbar()
     }
 
-    /// Whether the docked accessory bar should be on screen right now: only while
-    /// the software keyboard is up and the SwiftUI composer is not active (the
-    /// composer owns the bottom edge + keyboard when open). The bar is an input
-    /// accessory, so it hides when the keyboard is down.
+    /// Whether the docked accessory bar should be on screen right now: while the
+    /// software keyboard is up, INCLUDING when the SwiftUI composer is active. The
+    /// composer is a sibling `safeAreaInset` below this surface, so the surface
+    /// bounds already exclude its height; the bar sits at the surface's bottom edge
+    /// (above the composer, above the keyboard) without overlapping it. Round 4
+    /// changed this from hiding on `composerActive`: Lawrence wants the modifier /
+    /// arrow / Ctrl row to stay reachable while composing, with the composer text
+    /// area growing taller instead of the bar vanishing. The bar is an input
+    /// accessory, so it still hides when the keyboard is down.
     private var dockedToolbarShouldBeVisible: Bool {
-        keyboardHeight > 0 && !composerActive
+        keyboardHeight > 0
     }
 
     /// Reconcile the docked bar's visibility (and its reserved grid height) with
@@ -1292,17 +1303,33 @@ public final class GhosttySurfaceView: UIView, TerminalSurfaceHosting {
         setNeedsLayout()
     }
 
-    /// Hide or restore the docked accessory bar while the SwiftUI composer is
-    /// open. The composer owns the bottom edge (and the keyboard) when active, so
-    /// the docked bar would otherwise collide with it above the keyboard.
+    /// Track whether the SwiftUI composer is open and keep the keyboard up across
+    /// the draft↔normal toggle in BOTH directions.
+    ///
+    /// The docked accessory bar now stays visible while the composer is open (see
+    /// ``dockedToolbarShouldBeVisible``), so this no longer hides it. Its remaining
+    /// job is the first-responder handover that keeps the keyboard from dropping:
+    ///
+    /// - Opening (`active == true`): deliberately do NOT resign the terminal input
+    ///   proxy. The composer's text field becomes first responder while this
+    ///   keyboard is still up, so iOS hands the keyboard over in place. Resigning
+    ///   first tore the keyboard down and the composer re-summoned it (a flicker).
+    /// - Closing (`active == false`): the composer's field is being torn out of the
+    ///   hierarchy and resigns first responder, with nothing to take it back, so the
+    ///   keyboard would animate down. Re-take it on the terminal input proxy in the
+    ///   same SwiftUI update so some responder is always first responder at runloop
+    ///   end and the keyboard hands back in place instead of dropping. No sleep /
+    ///   `asyncAfter`: the `become` is issued synchronously here.
     public func setComposerActive(_ active: Bool) {
         guard composerActive != active else { return }
         composerActive = active
-        // Deliberately do NOT resign the terminal input proxy here. The composer's
-        // text field becomes first responder while this keyboard is still up, so
-        // iOS hands the keyboard over in place. Resigning first tore the keyboard
-        // down and the composer immediately re-summoned it (the visible
-        // disappear/reappear flicker).
+        if !active, window != nil, !isDismantled, !inputProxy.isFirstResponder {
+            // Composer dismissed: pull first responder back to the terminal input so
+            // the keyboard stays up across the toggle.
+            Self.activeInputSurface = self
+            inputProxy.updateAccessoryLayoutInsets()
+            inputProxy.becomeFirstResponder()
+        }
         updateDockedToolbarVisibility()
     }
 
@@ -3079,7 +3106,9 @@ private class DisplayLinkProxy {
 final class TerminalArrowNubView: UIView {
     var onArrowKey: ((Data) -> Void)?
 
-    private let nubSize: CGFloat = 34
+    // Locked to the size the docked bar actually pins the nub to, so the circular
+    // background (cornerRadius = nubSize/2) and the drag clamp track the real frame.
+    private let nubSize: CGFloat = TerminalInputTextView.dockedNubSize
     private let deadZone: CGFloat = 8
     private let repeatInterval: Duration = .milliseconds(80)
     private let innerDot = UIView()
