@@ -2773,7 +2773,7 @@ struct CMUXCLI {
         "--order", "--out", "--pane", "--panel", "--path", "--profile", "--property",
         "--provider", "--relay-port", "--script", "--selector", "--session",
         "--shell", "--source", "--subtitle", "--surface", "--tab", "--target-pane",
-        "--text", "--timeout", "--timeout-ms", "--title", "--transcript",
+        "--text", "--timeout", "--timeout-ms", "--title", "--tmux", "--transcript",
         "--turn", "--type", "--url", "--url-contains", "--value", "--window",
         "--workspace", "--checkpoint", "--checkpoint-id",
     ]
@@ -3842,6 +3842,15 @@ struct CMUXCLI {
             // Hidden compatibility alias for workspaces created before the split helper was
             // nested under `cmux vm`.
             try runVMSSHAttach(commandArgs: commandArgs, client: client)
+
+        case "tmux":
+            try runTmuxCommand(
+                commandArgs: commandArgs,
+                client: client,
+                jsonOutput: jsonOutput,
+                idFormat: idFormat,
+                windowOverride: windowId
+            )
 
         case "new-workspace":
             Self.warnLegacyVerbDeprecated("new-workspace", replacement: "cmux workspace create")
@@ -5128,6 +5137,7 @@ struct CMUXCLI {
         "swap-pane",
         "tab-action",
         "themes",
+        "tmux",
         "top",
         "tree",
         "trigger-flash",
@@ -12574,6 +12584,116 @@ struct CMUXCLI {
         throw CLIError(message: "Unsupported browser subcommand: \(subcommand)")
     }
 
+    private func runTmuxCommand(
+        commandArgs: [String],
+        client: SocketClient,
+        jsonOutput: Bool,
+        idFormat: CLIIDFormat,
+        windowOverride: String?
+    ) throws {
+        var remaining = commandArgs
+        let (sessionOpt, rem0) = parseOption(remaining, name: "--session")
+        let (shortSessionOpt, rem1) = parseOption(rem0, name: "-s")
+        let (nameOpt, rem2) = parseOption(rem1, name: "--name")
+        let (cwdOpt, rem3) = parseOption(rem2, name: "--cwd")
+        let (workspaceOpt, rem4) = parseOption(rem3, name: "--workspace")
+        let (paneOpt, rem5) = parseOption(rem4, name: "--pane")
+        let (surfaceOpt, rem6) = parseOption(rem5, name: "--surface")
+        let (splitOpt, rem7) = parseOption(rem6, name: "--split")
+        let (focusOpt, rem8) = parseOption(rem7, name: "--focus")
+        let (windowOpt, rem9) = parseOption(rem8, name: "--window")
+        let (tmuxOpt, rem10) = parseOption(rem9, name: "--tmux")
+        remaining = rem10
+
+        var noFocus = false
+        remaining.removeAll { arg in
+            if arg == "--no-focus" {
+                noFocus = true
+                return true
+            }
+            return false
+        }
+
+        let action: String
+        if let first = remaining.first?.lowercased(),
+           ["attach", "attach-session", "new", "new-session", "open"].contains(first) {
+            action = first
+            remaining.removeFirst()
+        } else {
+            action = "open"
+        }
+
+        if let unknown = remaining.first(where: { $0.hasPrefix("-") && $0 != "--" }) {
+            throw CLIError(message: "tmux: unknown flag '\(unknown)'")
+        }
+
+        let positionalSession = remaining.first { $0 != "--" }
+        let session = (sessionOpt ?? shortSessionOpt ?? nameOpt ?? positionalSession ?? "cmux")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !session.isEmpty else {
+            throw CLIError(message: "tmux requires a non-empty session name")
+        }
+
+        let tmuxExecutable: String
+        if let tmuxOpt,
+           !tmuxOpt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            tmuxExecutable = tmuxOpt
+        } else {
+            tmuxExecutable = "tmux"
+        }
+        let tmuxCommand: String
+        switch action {
+        case "attach", "attach-session":
+            tmuxCommand = "exec \(shellQuote(tmuxExecutable)) attach-session -t \(shellQuote(session))"
+        case "new", "new-session":
+            tmuxCommand = "exec \(shellQuote(tmuxExecutable)) new-session -s \(shellQuote(session))"
+        default:
+            tmuxCommand = "exec \(shellQuote(tmuxExecutable)) new-session -A -s \(shellQuote(session))"
+        }
+
+        var params: [String: Any] = [
+            "type": "terminal",
+            "initial_command": tmuxCommand,
+            "tmux_start_command": tmuxCommand
+        ]
+        let windowRaw = windowOpt ?? windowOverride
+        let winId = try normalizeWindowHandle(windowRaw, client: client)
+        if let winId { params["window_id"] = winId }
+        let workspaceArg = workspaceOpt ?? (windowRaw == nil ? ProcessInfo.processInfo.environment["CMUX_WORKSPACE_ID"] : nil)
+        let wsId = try normalizeWorkspaceHandle(workspaceArg, client: client, windowHandle: winId)
+        if let wsId { params["workspace_id"] = wsId }
+        if let cwd = cwdOpt?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !cwd.isEmpty {
+            params["working_directory"] = resolvePath(cwd)
+        }
+
+        let focusValue = noFocus ? "false" : focusOpt
+        try applyFocusOption(focusValue, defaultValue: true, to: &params)
+
+        let payload: [String: Any]
+        if let split = splitOpt?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !split.isEmpty {
+            params["direction"] = try validatedSplitDirection(split, commandName: "tmux")
+            let surfaceRaw = surfaceOpt ?? (windowRaw == nil ? ProcessInfo.processInfo.environment["CMUX_SURFACE_ID"] : nil)
+            let surfaceId = try normalizeSurfaceHandle(surfaceRaw, client: client, workspaceHandle: wsId, windowHandle: winId)
+            if let surfaceId { params["surface_id"] = surfaceId }
+            payload = try client.sendV2(method: "pane.create", params: params)
+        } else {
+            if let paneOpt,
+               !paneOpt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                let paneId = try normalizePaneHandle(paneOpt, client: client, workspaceHandle: wsId, windowHandle: winId)
+                if let paneId { params["pane_id"] = paneId }
+            }
+            payload = try client.sendV2(method: "surface.create", params: params)
+        }
+        printV2Payload(
+            payload,
+            jsonOutput: jsonOutput,
+            idFormat: idFormat,
+            fallbackText: v2OKSummary(payload, idFormat: idFormat, kinds: ["surface", "pane", "workspace"])
+        )
+    }
+
     private func parseWindows(_ response: String) -> [WindowInfo] {
         guard response != "No windows" else { return [] }
         return response
@@ -13177,6 +13297,34 @@ struct CMUXCLI {
               cmux omc
               cmux omc team 3:claude "implement feature"
               cmux omc --watch
+            """)
+        case "tmux":
+            return String(localized: "cli.tmux.usage", defaultValue: """
+            Usage: cmux tmux [open|attach|new] [session] [options]
+
+            Open a cmux terminal attached to a tmux session.
+
+            Modes:
+              open                 Attach to the session if it exists, otherwise create it (default)
+              attach               Attach only; fail if the session does not exist
+              new                  Create only; fail if the session already exists
+
+            Options:
+              --session, -s <name>  Session name (defaults to cmux)
+              --cwd <path>          Working directory for the terminal
+              --workspace <id|ref>  Target workspace, defaults to the caller workspace
+              --pane <id|ref>       Target pane
+              --surface <id|ref>    Source surface for --split, defaults to the caller surface
+              --split <direction>   Create a split instead of a new surface in the pane
+              --focus <true|false>  Focus the new terminal (default true)
+              --no-focus            Do not focus the new terminal
+              --tmux <path>         tmux executable path (default: tmux)
+
+            Examples:
+              cmux tmux work
+              cmux tmux attach -s work
+              cmux tmux new scratch --cwd ~/src/app
+              cmux tmux work --split right
             """)
         case "identify":
             return """
@@ -32332,6 +32480,7 @@ export default function cmuxPiSessionExtension(pi: ExtensionAPI) {
           omo [opencode-args...]
           omx [omx-args...]
           omc [omc-args...]
+          tmux [open|attach|new] [session] [--workspace <id|ref|index>] [--pane <id|ref|index>] [--surface <id|ref|index>] [--split <left|right|up|down>] [--cwd <path>]
           hooks setup|uninstall [--agent <name>]
           hooks <agent> <install|uninstall|event> [options; opencode supports --project]
           hooks feed --source <agent> [--event <event>]
