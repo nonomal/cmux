@@ -1846,6 +1846,7 @@ final class BrowserDeveloperToolsConfigurationTests: XCTestCase {
                 GhosttyNotificationKey.backgroundOpacity: updatedOpacity
             ]
         )
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
 
         guard let actual = panel.webView.underPageBackgroundColor?.usingColorSpace(.sRGB),
               let expected = updatedColor.withAlphaComponent(updatedOpacity).usingColorSpace(.sRGB) else {
@@ -1916,6 +1917,7 @@ final class BrowserDeveloperToolsConfigurationTests: XCTestCase {
                 GhosttyNotificationKey.backgroundOpacity: NSNumber(value: 0.57),
             ]
         )
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
 
         guard let actual = panel.webView.underPageBackgroundColor?.usingColorSpace(.sRGB),
               let expected = updatedColor.withAlphaComponent(0.57).usingColorSpace(.sRGB) else {
@@ -2932,6 +2934,7 @@ final class BrowserDeveloperToolsVisibilityPersistenceTests: XCTestCase {
     }
 
     private final class FakeInspector: NSObject {
+        private static var retainedFrontendWebViews: [WKWebView] = []
         enum HideBehavior {
             case unsupported
             case noEffect
@@ -3001,9 +3004,7 @@ final class BrowserDeveloperToolsVisibilityPersistenceTests: XCTestCase {
             frontendWebView
         }
 
-        func setFrontendWebView(_ webView: WKWebView?) {
-            frontendWebView = webView
-        }
+        func setFrontendWebView(_ webView: WKWebView?) { frontendWebView = webView; if let webView { Self.retainedFrontendWebViews.append(webView) } }
     }
 
     override class func setUp() {
@@ -3280,11 +3281,9 @@ final class BrowserDeveloperToolsVisibilityPersistenceTests: XCTestCase {
             defer: false
         )
         inspectorWindow.title = "Web Inspector — example.com"
-        let frontendWebView = WKInspectorProbeWebView(
-            frame: inspectorWindow.contentView?.bounds ?? .zero,
-            configuration: WKWebViewConfiguration()
-        )
+        let frontendWebView = WKInspectorProbeWebView(frame: inspectorWindow.contentView?.bounds ?? .zero, configuration: WKWebViewConfiguration())
         inspectorWindow.contentView?.addSubview(frontendWebView)
+        inspectorWindow.contentView?.addSubview(WKInspectorProbeView(frame: inspectorWindow.contentView?.bounds ?? .zero))
         inspector.setFrontendWebView(frontendWebView)
         defer { closeWindow(inspectorWindow) }
 
@@ -3366,7 +3365,7 @@ final class BrowserDeveloperToolsVisibilityPersistenceTests: XCTestCase {
         defer { closeWindow(inspectorWindow) }
 
         inspectorWindow.makeKeyAndOrderFront(nil)
-        inspectorWindow.makeKey()
+        inspectorWindow.makeKey(); RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
         XCTAssertTrue(browserPanel.showDeveloperTools())
         XCTAssertEqual(inspector.closeCount, 0)
         XCTAssertTrue(inspectorWindow.isKeyWindow)
@@ -3424,7 +3423,7 @@ final class BrowserDeveloperToolsVisibilityPersistenceTests: XCTestCase {
         defer { closeWindow(inspectorWindow) }
 
         inspectorWindow.makeKeyAndOrderFront(nil)
-        inspectorWindow.makeKey()
+        inspectorWindow.makeKey(); RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
         XCTAssertTrue(browserPanel.showDeveloperTools())
         XCTAssertEqual(inspector.closeCount, 0)
         XCTAssertTrue(inspectorWindow.isKeyWindow)

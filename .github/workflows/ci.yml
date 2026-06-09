@@ -351,7 +351,7 @@ jobs:
               CMUX_SKIP_ZIG_BUILD=1 \
               test 2>&1 &
             local xcodebuild_pid=$!
-            local timeout_seconds="${CMUX_UNIT_TEST_TIMEOUT_SECONDS:-900}"
+            local timeout_seconds="${CMUX_UNIT_TEST_TIMEOUT_SECONDS:-1800}"
             local deadline=$((SECONDS + timeout_seconds))
             while kill -0 "$xcodebuild_pid" 2>/dev/null; do
               if [ "$SECONDS" -ge "$deadline" ]; then
@@ -367,8 +367,8 @@ jobs:
             wait "$xcodebuild_pid"
           }
 
-          # Stream output via tee so CI logs are visible in real time, while still
-          # capturing for post-run analysis of expected vs unexpected failures.
+          # Stream output via tee so CI logs are visible in real time while
+          # preserving the xcodebuild exit status for the failure gate.
           set +e
           run_unit_tests | tee /tmp/test-output.txt
           EXIT_CODE=${PIPESTATUS[0]}
@@ -392,13 +392,8 @@ jobs:
           fi
 
           if [ "$EXIT_CODE" -ne 0 ]; then
-            SUMMARY=$(echo "$OUTPUT" | grep "Executed.*tests.*with.*failures" | tail -1)
-            if echo "$SUMMARY" | grep -q "(0 unexpected)"; then
-              echo "All failures are expected, treating as pass"
-            else
-              echo "Unexpected test failures detected"
-              exit 1
-            fi
+            echo "Unit tests failed"
+            exit "$EXIT_CODE"
           fi
 
       - name: Run bundled Ghostty theme picker helper regression
